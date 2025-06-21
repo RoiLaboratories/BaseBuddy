@@ -9,7 +9,13 @@
   "routes": [
     {
       "src": "/api/webhook",
-      "dest": "/api/webhook.ts"
+      "methods": ["POST", "OPTIONS"],
+      "dest": "/api/webhook.ts",
+      "headers": {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Methods": "OPTIONS,POST"
+      }
     }
   ],
   "env": {
