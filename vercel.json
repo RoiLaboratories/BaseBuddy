@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
   "builds": [
     {
       "src": "api/**/*.ts",
@@ -8,17 +10,12 @@
   ],
   "routes": [
     {
-      "src": "/api/webhook",
-      "methods": ["POST", "OPTIONS"],
-      "dest": "/api/webhook.ts",
-      "headers": {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Allow-Methods": "OPTIONS,POST"
-      }
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
     }
   ],
   "env": {
     "NODE_ENV": "production"
-  }
+  },
+  "regions": ["cdg1"]
 }
