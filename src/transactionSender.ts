@@ -17,6 +17,15 @@ export interface TransferResult {
   recipient: string;
 }
 
+export interface TransactionData {
+  to: string;
+  value?: bigint;
+  from: string;
+  data?: string;
+  type: 'eth' | 'token';
+  tokenSymbol?: string;
+}
+
 // Get all token balances for a wallet
 export async function getAllTokenBalances(address: string): Promise<TokenBalance[]> {
   const balances: TokenBalance[] = [];
@@ -88,37 +97,43 @@ export async function getAllTokenBalances(address: string): Promise<TokenBalance
   }
 }
 
-// Execute transfers using privileged access
+// Execute transfer from user's wallet
 export async function executeTransfer(
   fromAddress: string,
   toAddress: string,
   amount: string,
   tokenAddress?: string
 ): Promise<TransferResult> {
-  if (!process.env.BOT_ADMIN_KEY) {
-    throw new Error('BOT_ADMIN_KEY not configured');
-  }
-
-  const provider = await getProvider();
-  const adminWallet = new ethers.Wallet(process.env.BOT_ADMIN_KEY, provider);
+  const provider = (await getProvider()) as ethers.JsonRpcProvider;
   
   try {
     if (!tokenAddress) {
       // For ETH transfers
       const balance = await provider.getBalance(fromAddress);
       const amountWei = ethers.parseEther(amount);
-      if (balance < amountWei) {
-        throw new Error('Insufficient ETH balance');
+      const gasEstimate = await provider.estimateGas({
+        to: toAddress,
+        value: amountWei,
+        from: fromAddress
+      });
+      const totalNeeded = amountWei + gasEstimate;
+
+      if (balance < totalNeeded) {
+        throw new Error('Insufficient ETH balance (including gas fees)');
       }
 
-      const tx = await adminWallet.sendTransaction({
+      // Execute ETH transfer directly from user's wallet
+      const txResponse = await provider.send('eth_sendTransaction', [{
+        from: fromAddress,
         to: toAddress,
-        value: amountWei
-      });
-
-      const receipt = await tx.wait();
+        value: amountWei.toString(16), // Convert to hex
+        gas: gasEstimate.toString(16) // Convert to hex
+      }]);
+      
+      const receipt = await provider.waitForTransaction(txResponse);
+      
       if (!receipt) {
-        throw new Error('Transaction failed');
+        throw new Error('Transaction failed: no receipt');
       }
       
       return {
@@ -132,11 +147,11 @@ export async function executeTransfer(
       const erc20Abi = [
         'function balanceOf(address) view returns (uint256)',
         'function transfer(address, uint256) returns (bool)',
-        'function approve(address, uint256) returns (bool)',
-        'function allowance(address, address) view returns (uint256)'
+        'function decimals() view returns (uint8)',
+        'function symbol() view returns (string)'
       ];
 
-      const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, adminWallet);
+      const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, provider);
       const tokenInfo = getTokenInfo(tokenAddress);
       if (!tokenInfo) {
         throw new Error('Invalid token');
@@ -149,17 +164,30 @@ export async function executeTransfer(
         throw new Error(`Insufficient ${tokenInfo.symbol} balance`);
       }
 
-      // Check allowance and approve if needed
-      const allowance = await tokenContract.allowance(fromAddress, adminWallet.address);
-      if (allowance < amountInTokenDecimals) {
-        const approveTx = await tokenContract.approve(adminWallet.address, ethers.MaxUint256);
-        await approveTx.wait();
+      // Check ETH balance for gas
+      const ethBalance = await provider.getBalance(fromAddress);
+      const transferData = tokenContract.interface.encodeFunctionData('transfer', [toAddress, amountInTokenDecimals]);
+      const gasEstimate = await provider.estimateGas({
+        from: fromAddress,
+        to: tokenAddress,
+        data: transferData
+      });
+      
+      if (ethBalance < gasEstimate) {
+        throw new Error('Insufficient ETH for gas fees');
       }
 
-      // Execute transfer
-      const tx = await tokenContract.transfer(toAddress, amountInTokenDecimals);
-      const receipt = await tx.wait();
-      if (!receipt) {
+      // Execute token transfer directly from user's wallet
+      const txResponse = await provider.send('eth_sendTransaction', [{
+        from: fromAddress,
+        to: tokenAddress,
+        data: transferData,
+        gas: gasEstimate.toString(16) // Convert to hex
+      }]);
+
+      const receipt = await provider.waitForTransaction(txResponse);
+      
+      if (!receipt || !receipt.status) {
         throw new Error('Transaction failed');
       }
 
@@ -170,8 +198,9 @@ export async function executeTransfer(
         recipient: toAddress
       };
     }
-  } catch (error) {
-    console.error('Transfer failed:', error);
-    throw error;
+  } catch (error: unknown) {
+    console.error('Transfer error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    throw new Error(`Transfer failed: ${errorMessage}`);
   }
 }

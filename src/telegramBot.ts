@@ -13,7 +13,7 @@ import {
   type UserProfile,
   type UserWallet 
 } from './supabaseClient';
-import { executeTransfer, getAllTokenBalances, type TokenBalance } from './transactionSender';
+import { executeTransfer, getAllTokenBalances, type TokenBalance, type TransactionData } from './transactionSender';
 import { BASE_TOKENS } from './utils/token-utils';
 import { estimateGasCost } from './transactionTracker';
 import { XMTPAgent } from './xmtpAgent';
@@ -964,7 +964,8 @@ bot.on('text', async (ctx) => {
       }
     }
 
-    try {      // Get sender and recipient primary wallets
+    try {
+      // Get sender and recipient primary wallets
       if (!sender.wallets?.length || !recipientUser.wallets?.length) {
         if (chatType === 'private') {
           return ctx.reply('No wallets found. Please create a wallet first');
@@ -991,7 +992,7 @@ bot.on('text', async (ctx) => {
 
       // Validate token and get address
       const tokenAddress = token.toUpperCase() === 'ETH' 
-        ? ethers.ZeroAddress // Use ethers.ZeroAddress for ETH
+        ? undefined // For ETH transfers, we don't need a token address
         : tokenInfo?.address;
 
       // Validate token is supported
@@ -999,20 +1000,28 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`Unsupported token: ${token}`);
       }
 
-      // Validate token address exists
+      // Validate token address exists if not ETH
       if (token.toUpperCase() !== 'ETH' && !tokenAddress) {
         return ctx.reply(`Token ${token} has no contract address configured`);
       }
 
+      // Create message options with thread ID for group chats
+      const msgOptions = {
+        parse_mode: 'HTML' as const,
+        ...(chatType !== 'private' && ctx.message?.message_thread_id
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : {})
+      };
+
       // Send transfer progress message
       const progressMsg = await ctx.reply(
         `<b>💸 Processing Transfer...</b>\n\n` +
-        `Sending ${amount} ${token.toUpperCase()} to @${recipient}`,
+        `Sending ${amount} ${token.toUpperCase()} to @${recipient}...`,
         { parse_mode: 'HTML' }
       );
-
+      
       try {
-        // Execute the transfer using bot wallet
+        // Execute the transfer directly from the user's wallet
         const result = await executeTransfer(
           senderPrimary.address,
           recipientPrimary.address,
@@ -1020,37 +1029,41 @@ bot.on('text', async (ctx) => {
           tokenAddress
         );
 
-        // Create message options with thread ID for group chats
-        const msgOptions = {
-          parse_mode: 'HTML' as const,
-          ...(chatType !== 'private' && ctx.message?.message_thread_id
-            ? { message_thread_id: ctx.message.message_thread_id }
-            : {})
-        };
-
-        // Delete progress message
-        await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id);
-
-        // Send success message
-        await ctx.reply(
-          `<b>✅ Transfer Successful!</b>\n\n` +
-          `<b>Amount:</b> ${result.amount} ${result.token}\n` +
-          `<b>To:</b> @${recipient}\n` +
-          `<b>Hash:</b> <code>${result.hash}</code>`,
-          msgOptions
-        );
-      } catch (error) {
         // Delete progress message
         await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
-        throw error;
+
+        // Send success message to user
+        await ctx.reply(
+          `<b>✅ Transfer Successful!</b>\n\n` +
+          `Successfully sent ${result.amount} ${result.token} to @${recipient}\n\n` +
+          `<b>Transaction Hash:</b> <code>${result.hash}</code>`,
+          msgOptions
+        );
+      } catch (error: unknown) {
+        // Delete progress message
+        await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
+        
+        // Send error message to user
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        await ctx.reply(
+          `<b>❌ Transfer Failed</b>\n\n` +
+          `Failed to send ${amount} ${token.toUpperCase()} to @${recipient}\n\n` +
+          `<b>Error:</b> ${errorMessage}`,
+          msgOptions
+        );
+
+        // Log the error
+        console.error('Transfer execution error:', error);
       }
-    } catch (error) {
-      console.error('Transfer execution error:', error);
-      await ctx.reply('An error occurred while processing the transfer. Please try again.');
+    } catch (error: unknown) {
+      console.error('Transfer handler error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'An error occurred while processing your request';
+      await ctx.reply(errorMessage);
     }
-  } catch (error) {
-    console.error('Text message handler error:', error);
-    await ctx.reply('An error occurred while processing your message. Please try again.');
+  } catch (error: unknown) {
+    console.error('Message handler error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred';
+    await ctx.reply(errorMessage);
   }
 });
 
