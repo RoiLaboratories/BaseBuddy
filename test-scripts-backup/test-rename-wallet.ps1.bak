@@ -1,0 +1,44 @@
+# Test script for the wallet rename functionality
+Write-Host "Testing Wallet Rename Functionality" -ForegroundColor Cyan
+Write-Host "--------------------------------" -ForegroundColor Cyan
+
+# Check if telegramBot.ts exists
+$mainBotPath = Join-Path $PSScriptRoot "src\telegramBot.ts"
+
+# Check if the main bot file exists
+if (Test-Path $mainBotPath) {
+    Write-Host "Found main bot file at: $mainBotPath" -ForegroundColor Green
+} else {
+    Write-Host "ERROR: Main bot file not found at: $mainBotPath" -ForegroundColor Red
+    exit 1
+}
+
+# First, ensure no bot instances are running
+$stopScript = Join-Path $PSScriptRoot "stop-bots.ps1"
+Write-Host "Running stop-bots.ps1 to ensure clean startup..." -ForegroundColor Yellow
+& $stopScript
+
+# Start the bot with debugging enabled
+Write-Host "Starting bot with enhanced debugging for rename functionality..." -ForegroundColor Green
+$env:DEBUG_RENAME = "true"
+Start-Process powershell -ArgumentList "-NoExit -Command `"cd '$PSScriptRoot'; .\start-bot.ps1`""
+
+# Wait for the bot to initialize
+Start-Sleep -Seconds 5
+
+Write-Host "`n=== WALLET RENAME TESTING INSTRUCTIONS ===" -ForegroundColor Magenta
+Write-Host "Please test the following in Telegram:"
+Write-Host "1. Run /wallets command" -ForegroundColor Yellow
+Write-Host "2. Click on the '✏️ Rename' button for any wallet" -ForegroundColor Yellow
+Write-Host "3. Enter a new name for the wallet" -ForegroundColor Yellow
+Write-Host "4. Check if the wallet name is updated in the wallet list" -ForegroundColor Yellow
+Write-Host "5. Check the debug output in the bot window for any errors" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "When finished testing, press Enter to stop the bot and complete testing."
+Read-Host
+
+# Stop the bot when testing is complete
+Write-Host "Stopping the bot..." -ForegroundColor Yellow
+& $stopScript
+
+Write-Host "`nTesting completed! Please document your results in TESTING-RESULTS.md" -ForegroundColor Cyan

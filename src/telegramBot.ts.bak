@@ -1,0 +1,2354 @@
+import { Telegraf, Context, session } from 'telegraf';
+import type { ParseMode } from 'telegraf/typings/core/types/typegram';
+import { ethers } from 'ethers';
+import { 
+  getUserByTelegramUsername, 
+  storeUserProfile, 
+  getUserWallets, 
+  createWallet, 
+  setWalletAsPrimary,
+  getWalletById,
+  deleteWallet,
+  updateWalletName,
+  type UserProfile,
+  type UserWallet 
+} from './supabaseClient';
+import { generateTransactionRequest, getTokenBalance } from './transactionSender';
+import { getSwapQuote } from './uniswap';
+import { estimateGasCost } from './transactionTracker';
+import { XMTPAgent } from './xmtpAgent';
+import { generateWallet } from './utils/generate-wallet';
+import dotenv from 'dotenv';
+
+// Enable debug for rename wallet functionality if env var is set
+const DEBUG_RENAME = process.env.DEBUG_RENAME === 'true';
+
+dotenv.config();
+
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  throw new Error('TELEGRAM_BOT_TOKEN is required');
+}
+
+const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL);
+
+// Custom session type
+interface BotSession {
+  sensitiveMessageId?: number;
+  renameWalletId?: string;
+}
+
+// Extend context type to include session
+interface BotContext extends Context {
+  session: BotSession;
+}
+
+// Bot setup and command registration
+const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
+const xmtpAgent = new XMTPAgent();
+
+// Configure session middleware (only once!)
+bot.use(session({
+  defaultSession: () => ({ 
+    sensitiveMessageId: undefined,
+    renameWalletId: undefined
+  })
+}));
+
+// Session middleware to ensure session exists
+bot.use(async (ctx, next) => {
+  ctx.session = ctx.session || {};
+  await next();
+});
+
+// Register commands with their handlers
+bot.command('send', sendCommandHandler);
+bot.command('swap', swapCommandHandler);
+bot.command('gas', gasCommandHandler);
+bot.command('help', helpCommandHandler);
+bot.command('wallets', walletsCommandHandler);
+bot.command('newwallet', newWalletCommandHandler);
+
+// Define the main menu keyboard
+const mainMenuKeyboard = {
+  reply_markup: {
+    remove_keyboard: true as const  // Use 'as const' to indicate this is specifically true, not just a boolean
+  }
+};
+
+// Helper functions for reply options
+function createReplyOptions(options: {
+  parse_mode?: ParseMode;
+  message_thread_id?: number;
+  extra?: Record<string, any>;
+}): {
+  parse_mode: ParseMode;
+  message_thread_id?: number;
+  reply_markup: typeof mainMenuKeyboard.reply_markup;
+  [key: string]: any;
+} {
+  return {
+    parse_mode: (options.parse_mode || 'HTML') as ParseMode,
+    ...(options.message_thread_id ? { message_thread_id: options.message_thread_id } : {}),
+    ...(options.extra || {}),
+    reply_markup: mainMenuKeyboard.reply_markup
+  };
+}
+
+// Register command handlers here
+// Command: /portfolio
+bot.command('portfolio', async (ctx) => {
+  try {
+    console.log('Portfolio command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please check your portfolio in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    // Get user's primary wallet
+    const wallets: UserWallet[] = await getUserWallets(user.telegram_id);
+    const primaryWallet: UserWallet | undefined = wallets.find(w => w.is_primary);
+    if (!primaryWallet) {
+      return ctx.reply(
+        'You have no primary wallet set. Use /wallets to manage your wallets or /start to create one.'
+      );
+    }
+
+    try {
+      const tokenBalances = await getAllTokenBalances(primaryWallet.address);
+      
+      if (tokenBalances.length === 0) {
+        return ctx.reply('No token balances found in this wallet.');
+      }
+
+      let totalUsdValue = 0;
+      const balanceLines = tokenBalances.map((token: TokenBalance) => {
+        totalUsdValue += token.usdValue;
+        return `${token.symbol}: ${token.balance}\n≈ $${token.usdValue.toFixed(2)} USD`;
+      }).join('\n\n');
+
+      const portfolioMessage = `
+<b>💼 Your Base Portfolio</b>
+
+<code>
+${balanceLines}
+
+Total Value: $${totalUsdValue.toFixed(2)} USD
+</code>
+
+<b>🔍 Quick Actions:</b>
+• Send ETH
+• Swap tokens
+• Check gas prices
+`;
+
+      await ctx.reply(portfolioMessage, {
+        parse_mode: 'HTML' as ParseMode,
+        reply_markup: mainMenuKeyboard.reply_markup
+      });
+    } catch (error) {
+      console.error('Error fetching portfolio:', error);
+      await ctx.reply(
+        '❌ Error fetching your portfolio. Please try again later.\n' +
+        'If the problem persists, check your wallet connection.'
+      );
+    }
+  } catch (error) {
+    console.error('Portfolio command error:', error);
+    await ctx.reply('An error occurred while processing your portfolio request.');
+  }
+});
+
+async function sendCommandHandler(ctx: BotContext) {
+  try {
+    console.log('Send command received directly');
+    await ctx.reply(
+      '<b>💸 How to Send ETH</b>\n\n' +
+      'Use this format:\n' +
+      '<code>send [amount] ETH to @username</code>\n\n' +
+      'For example:\n' +
+      '<code>send 0.1 ETH to @john</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Make sure you have enough ETH for gas\n' +
+      '• Double-check the recipient username\n' +
+      '• Verify transaction details before signing',
+      createReplyOptions({ parse_mode: 'HTML' as ParseMode })
+    );
+  } catch (error) {
+    console.error('Send command error:', error);
+    await ctx.reply('An error occurred while processing your send request.');
+  }
+}
+
+async function swapCommandHandler(ctx: BotContext) {
+  try {
+    console.log('Swap command received directly');
+    await ctx.reply(
+      '<b>🔄 How to Swap Tokens</b>\n\n' +
+      'Use this format:\n' +
+      '<code>buy [amount] [token] with [amount] ETH</code>\n\n' +
+      'For example:\n' +
+      '<code>buy 50 USDC with 0.05 ETH</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Check token prices before swapping\n' +
+      '• Watch for slippage on large trades\n' +
+      '• Consider gas fees in your calculations',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Swap command error:', error);
+    await ctx.reply('An error occurred while processing your swap request.');
+  }
+}
+
+async function gasCommandHandler(ctx: BotContext) {
+  try {
+    console.log('Gas command received directly');
+    try {
+      const feeData = await provider.getFeeData();
+      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice;
+      
+      if (!maxFeePerGas) {
+        throw new Error('Could not get gas price');
+      }
+
+      const gasMessage = `
+<b>⛽️ Current Base Gas Prices</b>
+
+<code>
+Max Fee:     ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei
+Priority:    ${feeData.maxPriorityFeePerGas ? ethers.formatUnits(feeData.maxPriorityFeePerGas, 'gwei') : 'N/A'} Gwei
+</code>
+
+<i>💡 Gas prices on Base are typically very low!</i>
+
+Estimated costs:
+• ETH Transfer: ~0.0001 ETH
+• Token Swap: ~0.0003 ETH
+`;
+
+      await ctx.reply(gasMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('Error fetching gas prices:', error);
+      await ctx.reply(
+        '❌ Error fetching gas prices. Please try again later.\n' +
+        'If the problem persists, there may be network issues.'
+      );
+    }
+  } catch (error) {
+    console.error('Gas command error:', error);
+    await ctx.reply('An error occurred while processing your gas price request.');
+  }
+}
+
+async function helpCommandHandler(ctx: BotContext) {
+  try {
+    console.log('Help command received directly');
+    const chatType = ctx.chat?.type;
+    const options = chatType !== 'private' && ctx.message?.message_thread_id 
+      ? { message_thread_id: ctx.message.message_thread_id, parse_mode: 'HTML' }
+      : { parse_mode: 'HTML' };
+      
+    let helpMessage = `<b>🤖 BaseBuddy Help Guide</b>\n\n` +
+      `<b>Available Commands:</b>\n\n` +
+      `/start - Create your first wallet\n` +
+      `/portfolio - View your wallet balances\n` +
+      `/wallets - Manage your wallets\n` +
+      `/newwallet - Create additional wallet\n` +
+      `/send - Send ETH to others\n` +
+      `/swap - Swap tokens on Base\n` +
+      `/gas - Check current gas prices\n` +
+      `/help - Show this help message\n\n` +
+      `<b>Quick Commands:</b>\n` +
+      `• <code>send 0.1 ETH to @user</code>\n` +
+      `• <code>buy 50 USDC with 0.1 ETH</code>\n\n`;
+
+    if (chatType !== 'private') {
+      helpMessage += `<b>In Group Chats:</b>\n` +
+      `• Tag me with @${ctx.botInfo?.username} to use commands\n` +
+      `• Example: <code>@${ctx.botInfo?.username} send 0.1 ETH to @user</code>\n` +
+      `• Example: <code>@${ctx.botInfo?.username} buy 50 USDC with 0.1 ETH</code>\n\n`;
+    }    helpMessage += `<b>Need More Help?</b>\n` +
+      `• Use each command to see detailed instructions\n` +
+      `• Keep your wallet details safe\n` +
+      `• Never share your private keys\n\n` +
+      `<i>🔐 For security, use private chat for sensitive operations</i>`;
+    
+    await ctx.reply(helpMessage, { 
+      parse_mode: 'HTML' as ParseMode,
+      reply_markup: mainMenuKeyboard.reply_markup
+    });
+  } catch (error) {
+    console.error('Help command error:', error);
+    await ctx.reply('An error occurred while processing your help request.');
+  }
+}
+
+async function walletsCommandHandler(ctx: BotContext) {
+  try {
+    console.log('Wallets command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please manage your wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      return ctx.reply(
+        '❌ You have no wallets yet.\n\n' +
+        'Use /start to create your first wallet!'
+      );
+    }    // Create a message with wallet info
+    let messageText = `<b>🏦 Your Wallets</b>\n\n`;
+    
+    // Create inline keyboard buttons for each wallet address
+    const addressButtons: { text: string, callback_data: string }[][] = [];
+    
+    wallets.forEach((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      
+      // Add wallet info to message
+      messageText += `${index + 1}. ${name}${isPrimary}\n`;
+      messageText += `   <code>${shortAddress}</code>\n\n`;
+      
+      // Add button to copy full address
+      addressButtons.push([
+        { text: `📋 Copy ${name} Address`, callback_data: `copy_address_${wallet.address}` }
+      ]);
+    });
+    
+    messageText += `<i>Click on a button to copy the full wallet address</i>\n`;
+    messageText += `<i>Or select an action below:</i>`;    await ctx.reply(
+      messageText,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...addressButtons,
+            [
+              { text: '➕ New Wallet', callback_data: 'new_wallet' },
+              { text: '🔄 Set Primary', callback_data: 'set_primary' }
+            ],
+            [
+              { text: '✏️ Rename', callback_data: 'rename_wallet' },
+              { text: '🗑️ Delete', callback_data: 'delete_wallet' }
+            ]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Wallets command error:', error);
+    await ctx.reply('An error occurred while processing your wallets request.');
+  }
+}
+
+async function newWalletCommandHandler(ctx: BotContext) {
+  try {
+    console.log('New wallet command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }    
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for security reasons, please create wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (wallets.length >= 5) {
+      return ctx.reply(
+        '❌ Maximum wallet limit reached (5).\n\n' +
+        'Use /wallets to manage your existing wallets.'
+      );
+    }
+
+    const wallet = generateWallet();
+    const walletNumber = wallets.length + 1;
+    
+    const storedWallet = await createWallet({
+      telegram_id: user.telegram_id,
+      address: wallet.address,
+      name: `Wallet ${walletNumber}`,
+      is_primary: false
+    });
+
+    if (!storedWallet) {
+      return ctx.reply('❌ Error creating wallet. Please try again.');
+    }
+
+    const sensitiveInfo = await ctx.reply(
+      `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
+      `<b>Wallet Address:</b>\n` +
+      `<code>${wallet.address}</code>\n\n` +
+      `<b>Private Key:</b>\n` +
+      `<code>${wallet.privateKey}</code>\n\n` +
+      `<b>Backup Phrase:</b>\n` +
+      `<code>${wallet.mnemonic}</code>\n\n` +
+      `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
+      `Copy and store this information securely NOW!`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
+          ]]
+        }
+      }
+    );
+
+    // Ensure session exists before setting properties
+    if (ctx.session) {
+      ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
+    } else {
+      console.warn('Session is undefined when trying to save sensitiveMessageId');
+    }
+  } catch (error) {
+    console.error('New wallet command error:', error);
+    await ctx.reply('An error occurred while creating a new wallet.');
+  }
+}
+
+// Bot setup function
+const setupBot = async () => {
+  try {
+    await bot.telegram.setMyDescription(
+      'BaseBuddy - Your DeFi companion on Base chain! Send ETH, swap tokens, and track your portfolio easily.'
+    );
+    
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Start the bot and create your first wallet' },
+      { command: 'portfolio', description: 'View your portfolio' },
+      { command: 'wallets', description: 'Manage your wallets' },
+      { command: 'newwallet', description: 'Create an additional wallet' },
+      { command: 'send', description: 'Send ETH to others' },
+      { command: 'swap', description: 'Swap tokens on Base' },
+      { command: 'gas', description: 'Check current gas prices' },
+      { command: 'help', description: 'Get help with commands' }
+    ]);
+    
+    await bot.telegram.setMyShortDescription(
+      '🚀 Easy crypto transactions on Base chain'
+    );
+    
+    console.log('Bot metadata configured successfully');
+  } catch (error) {
+    console.error('Error setting up bot metadata:', error);
+  }
+};
+
+// Start bot function
+const startBot = async () => {
+  try {
+    console.log('Setting up bot metadata...');
+    // Setup bot metadata first
+    await setupBot();
+    
+    console.log('Starting bot launch sequence...');
+    // Launch the bot
+    await bot.launch();
+    console.log('🚀 Bot is running...');
+
+    // Enable graceful stop
+    process.once('SIGINT', () => {
+      bot.stop('SIGINT');
+      console.log('Bot stopped due to SIGINT');
+    });
+    process.once('SIGTERM', () => {
+      bot.stop('SIGTERM');
+      console.log('Bot stopped due to SIGTERM');
+    });
+  } catch (error) {
+    console.error('Failed to start bot:', error);
+    // Provide more detailed error information
+    if (error instanceof Error && error.message && error.message.includes('409: Conflict')) {
+      console.error('ERROR: Another bot instance is already running!');
+      console.error('Use the stop-bots.ps1 script to stop all running instances first.');
+    }
+    process.exit(1);
+  }
+};
+
+// Enable debug logging
+bot.use(async (ctx, next) => {
+  const start = Date.now();
+  const messageType = ctx.updateType || 'unknown';
+  
+  // Safely get message text from different types of messages
+  let messageText = 'no text';
+  if (ctx.message && 'text' in ctx.message) {
+    messageText = ctx.message.text;
+  } else if (ctx.callbackQuery && 'data' in ctx.callbackQuery) {
+    messageText = `callback: ${ctx.callbackQuery.data}`;  }
+  
+  console.log(`Received [${messageType}]: ${messageText}`);
+  
+  try {
+    await next();
+    const ms = Date.now() - start;
+    console.log(`Response time: ${ms}ms for [${messageType}]: ${messageText}`);
+  } catch (error) {
+    console.error(`Error processing [${messageType}]: ${messageText}`, error);
+    throw error;
+  }
+});
+
+// Global error handler
+bot.catch(async (err: unknown, ctx: Context) => {
+  console.error('Bot error:', err);
+  try {
+    await ctx.reply('An error occurred while processing your request.');
+  } catch (replyError) {
+    console.error('Failed to send error message:', replyError);
+  }
+});
+
+// Add middleware for command handling
+bot.use(async (ctx, next) => {
+  try {
+    await next();
+  } catch (error) {
+    console.error('Error handling command:', error);
+    await ctx.reply('An error occurred while processing your request. Please try again.');
+  }
+});
+
+// Command handler function
+const handleCommand = async (ctx: BotContext, commandHandler: () => Promise<any>) => {
+  try {
+    // Log which command is being executed
+    let commandText = 'unknown command';
+    if (ctx.message && 'text' in ctx.message) {
+      commandText = ctx.message.text;
+    }
+    console.log(`Executing command handler for: ${commandText}`);
+    return await commandHandler();
+  } catch (error) {
+    console.error('Command error:', error);
+    await ctx.reply('An error occurred while processing your request. Please try again.');
+    return null;
+  }
+};
+
+// Helper function to validate and get user profile
+const validateUser = async (username: string): Promise<{ user: UserProfile; error?: undefined } | { user?: undefined; error: string }> => {
+  try {
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return { error: 'Please use /start to create your account first.' };
+    }
+    return { user };
+  } catch (error) {
+    console.error('Error validating user:', error);
+    return { error: 'Error validating user profile. Please try again.' };
+  }
+};
+
+// Command: /start
+bot.command('start', async (ctx) => {
+  try {
+    console.log('Start command received directly');
+    const telegramId = ctx.from?.id.toString();
+    const username = ctx.from?.username;
+    
+    if (!telegramId || !username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+
+    // Create or validate user profile
+    const userProfile: UserProfile = {
+      telegram_id: telegramId,
+      telegram_username: username,
+      created_at: new Date(),
+      updated_at: new Date()
+    };
+
+    // Check existing wallets
+    const userWallets: UserWallet[] = await getUserWallets(telegramId);
+    
+    // For existing users with wallets
+    if (userWallets.length > 0) {
+      return ctx.reply(
+        `Welcome back to BaseBuddy! 🚀\n\n` +
+        `You already have ${userWallets.length} wallet${userWallets.length > 1 ? 's' : ''}. ` +
+        `Use /wallets to manage them or /newwallet to create another one.`,
+        mainMenuKeyboard
+      );
+    }// For new users
+    await storeUserProfile(userProfile);
+
+    await ctx.reply(
+      `<b>Welcome to BaseBuddy! 🚀</b>\n\n` +
+      `I'll help you create your first wallet on Base chain.\n\n` +
+      `⚠️ <b>IMPORTANT:</b> In the next message, I will show you your:\n` +
+      `• Wallet Address\n` +
+      `• Private Key\n` +
+      `• Backup Phrase\n\n` +
+      `You MUST save these somewhere safe and never share them with anyone!\n\n` +
+      `Ready? Let's create your wallet!`,
+      { parse_mode: 'HTML' }
+    );
+
+    const wallet = generateWallet();
+    
+    const storedWallet = await createWallet({
+      telegram_id: telegramId,
+      address: wallet.address,
+      name: 'Primary Wallet',
+      is_primary: true
+    });
+
+    if (!storedWallet) {
+      await ctx.reply('❌ Error creating wallet. Please try again.');
+      return;
+    }
+
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('🔐 I\'ve sent your new wallet details in a private message. Click "Start" to view them.');
+      return;
+    }
+
+    const sensitiveInfo = await ctx.reply(
+      `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
+      `<b>Wallet Address:</b>\n` +
+      `<code>${wallet.address}</code>\n\n` +
+      `<b>Private Key:</b>\n` +
+      `<code>${wallet.privateKey}</code>\n\n` +
+      `<b>Backup Phrase:</b>\n` +
+      `<code>${wallet.mnemonic}</code>\n\n` +
+      `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
+      `Copy and store this information securely NOW!`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
+          ]]
+        }
+      }
+    );    
+    
+    // Safely set session property
+    if (ctx.session) {
+      ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
+    } else {
+      console.warn('Session is undefined in start command when setting sensitiveMessageId');
+    }  } catch (error) {
+    console.error('Start command error:', error);
+    await ctx.reply('An error occurred while processing your start request.');
+  }
+});
+
+// Handler for all text messages
+bot.on('text', async (ctx) => {
+  try {
+    const message = ctx.message.text;
+    const chatType = ctx.chat?.type;
+    const username = ctx.from?.username;
+      // For groups, only respond to messages that mention the bot
+    if (chatType !== 'private') {
+      const botUsername = ctx.botInfo?.username || '';
+      const mentionRegexPatterns = [
+        new RegExp(`@${botUsername}\\b`, 'i'),  // Standard mention format: @BotName
+        new RegExp(`^${botUsername}[,:]\\s`, 'i'),  // Alternative formats: "BotName, " or "BotName: "
+        new RegExp(`^hey\\s+@?${botUsername}\\b`, 'i'),  // Conversational: "Hey BotName"
+        new RegExp(`^hi\\s+@?${botUsername}\\b`, 'i')   // Conversational: "Hi BotName"
+      ];
+      
+      // Check if the message matches any of the mention patterns
+      const isBotMentioned = mentionRegexPatterns.some(pattern => pattern.test(message));
+      
+      if (!isBotMentioned) {
+        return; // Not addressed to the bot in a group chat
+      }
+    }
+
+    // Remove bot mention from message in groups
+    const cleanMessage = chatType !== 'private' 
+      ? message.replace(new RegExp(`@?${ctx.botInfo?.username}\\b[,:]?\\s*`, 'gi'), '').trim()
+      : message;
+      
+    console.log(`Processing message: "${cleanMessage}" from ${username || 'unknown'} in ${chatType} chat`);
+
+    // Handle send command
+    const sendMatch = cleanMessage.match(/^send ([\d.]+) ETH to @(\w+)/i);    
+    if (sendMatch) {
+      const [, amount, recipient] = sendMatch;
+      const senderUsername = ctx.from?.username;
+
+      if (!senderUsername) {
+        return ctx.reply('Error: Could not identify sender');
+      }
+      
+      // Log transaction attempt
+      console.log(`[SEND] User @${senderUsername} attempting to send ${amount} ETH to @${recipient} in ${chatType} chat`);
+      
+      const sender = await getUserByTelegramUsername(senderUsername);
+      const recipientUser = await getUserByTelegramUsername(recipient);
+      
+      // Check if both users exist
+      if (!sender) {
+        const options = chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : undefined;
+        return ctx.reply(`@${senderUsername}, please create an account first. Send me a direct message and use /start`, options);
+      }
+      
+      if (!recipientUser) {
+        const options = chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : undefined;
+        return ctx.reply(`Error: Recipient @${recipient} not found. They need to create an account first.`, options);
+      }      // Get sender's primary wallet
+      const senderWallets: UserWallet[] = await getUserWallets(sender.telegram_id);
+      const senderPrimaryWallet: UserWallet | undefined = senderWallets.find(w => w.is_primary);
+      if (!senderPrimaryWallet) {
+        const options = chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : undefined;
+          
+        if (chatType === 'private') {
+          return ctx.reply('Please create a wallet first using /start or select a primary wallet using /wallets');
+        } else {
+          return ctx.reply(`@${senderUsername}, please create a wallet first. Send me a DM and use /start`, options);
+        }
+      }
+
+    // Get recipient's primary wallet
+    const recipientWallets: UserWallet[] = await getUserWallets(recipientUser.telegram_id);
+    const recipientPrimary: UserWallet | undefined = recipientWallets.find(w => w.is_primary);
+    if (!recipientPrimary) {
+        const options = chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : undefined;
+          
+      if (chatType === 'private') {
+        return ctx.reply('Recipient has not created a wallet yet');
+      } else {
+        return ctx.reply(`@${recipient} needs to create a wallet first. Ask them to DM me and use /start`, options);
+      }
+    }    try {      
+      const txRequest = await generateTransactionRequest(
+        senderPrimaryWallet.address,
+        recipientPrimary.address,
+        amount
+      );
+
+      const gasEstimate = await estimateGasCost({
+        to: txRequest.to,
+        value: txRequest.amount
+      });      const walletUrl = new URL('https://www.coinbase.com/wallet/connect');
+      walletUrl.searchParams.set('action', 'send');
+      walletUrl.searchParams.set('to', txRequest.to);
+      walletUrl.searchParams.set('value', txRequest.amount);
+      walletUrl.searchParams.set('chainId', process.env.BASE_CHAIN_ID!);
+
+      const replyOptions = {
+        parse_mode: 'HTML' as ParseMode,
+        ...(chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id } 
+          : {}),
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🔐 Open Coinbase Wallet', url: walletUrl.toString() }
+          ]]
+        }
+      };
+
+      await ctx.reply(
+        `<b>💸 Transfer Request Created</b>\n\n` +
+        `<b>Amount:</b> ${amount} ETH\n` +
+        `<b>To:</b> @${recipient}\n\n` +
+        `<b>Estimated Costs:</b>\n` +
+        `Gas Fee: ~${gasEstimate.totalCost} ETH\n` +
+        `Gas Price: ${gasEstimate.maxFeePerGas} Gwei\n` +
+        `Total: ${(parseFloat(amount) + parseFloat(gasEstimate.totalCost)).toFixed(6)} ETH\n\n` +
+        `Click below to approve in Coinbase Wallet:`,
+        replyOptions
+      );    } catch (error) {
+      await ctx.reply('Error creating transaction request. Please try again later.');
+    }
+    return;
+  }  
+  
+  // Handle buy command  
+  const buyMatch = cleanMessage.match(/^buy (\d+) (\w+) with ([\d.]+) ETH/i);
+  if (buyMatch) {
+    const [, amount, tokenSymbol, ethAmount] = buyMatch;
+    const username = ctx.from?.username;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // Log the swap attempt
+    console.log(`[SWAP] User @${username} attempting to buy ${amount} ${tokenSymbol} with ${ethAmount} ETH in ${chatType} chat`);
+
+    const user = await getUserByTelegramUsername(username);
+    
+    if (!user) {
+      const options = chatType !== 'private' && ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+        
+      if (chatType === 'private') {
+        return ctx.reply('Please use /start to create your account first.');
+      } else {
+        return ctx.reply(`@${username}, please create an account first. Send me a direct message and use /start`, options);
+      }
+    }
+
+    // Get user's primary wallet
+    const wallets: UserWallet[] = await getUserWallets(user.telegram_id);
+    const primaryWallet: UserWallet | undefined = wallets.find(w => w.is_primary);
+    if (!primaryWallet) {
+      const options = chatType !== 'private' && ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+        
+      if (chatType === 'private') {
+        return ctx.reply('Please create a wallet first using /start');
+      } else {
+        return ctx.reply(`@${username}, please create a wallet first. Send me a DM and use /start`, options);
+      }
+    }    try {
+      const quote = await getSwapQuote(
+        'ETH',
+        tokenSymbol,
+        ethAmount
+      );      const swapLink = generateSwapLink('ETH', tokenSymbol, ethAmount);
+
+      const replyOptions = {
+        parse_mode: 'HTML' as 'HTML',
+        ...(chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id } 
+          : {}),
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🔄 Open in Uniswap', url: swapLink }
+          ]]
+        }
+      };      await ctx.reply(
+        `<b>🔄 Swap Quote</b>\n\n` +
+        `<b>You pay:</b> ${ethAmount} ETH\n` +
+        `<b>You receive:</b> ~${quote.expectedOutput} ${tokenSymbol}\n` +
+        `<b>Price Impact:</b> ${quote.priceImpact}%\n\n` +
+        `Complete the swap:`,
+        replyOptions
+      );    } catch (error) {      
+      const options = chatType !== 'private' && ctx.message?.message_thread_id
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+        
+      await ctx.reply('Error generating swap quote. Please try again later.', options);
+    }
+    return;
+  }
+    // Handle text messages with no specific command pattern
+    if (!sendMatch && !buyMatch && cleanMessage.trim()) {
+      const lowercaseMessage = cleanMessage.toLowerCase();
+      
+      // Check if this is just a greeting or generic mention
+      const greetingPatterns = [
+        /^(hey|hi|hello|help)/i,
+        /^what can you do/i,
+        /^how (do|can) (i|you|we)/i
+      ];
+      
+      if (greetingPatterns.some(pattern => pattern.test(lowercaseMessage))) {
+        const username = ctx.from?.username;
+        const options = chatType !== 'private' && ctx.message?.message_thread_id 
+          ? { message_thread_id: ctx.message.message_thread_id }
+          : undefined;
+          
+        const greeting = username ? `Hi @${username}! ` : 'Hi there! ';
+        
+        return ctx.reply(
+          `${greeting}I'm BaseBuddy, your DeFi companion on Base chain.\n\n` +
+          `You can:\n` +
+          `• Send ETH: "send 0.1 ETH to @username"\n` +
+          `• Buy tokens: "buy 50 USDC with 0.1 ETH"\n` +
+          `• Check gas: /gas\n\n` +
+          `Use /help for more commands!`,
+          options
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Text message handler error:', error);
+    await ctx.reply('An error occurred while processing your message. Please try again.');
+  }
+});
+
+// Command: /portfolio
+bot.command('portfolio', async (ctx) => {
+  try {
+    console.log('Portfolio command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please check your portfolio in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    // Get user's primary wallet
+    const wallets: UserWallet[] = await getUserWallets(user.telegram_id);
+    const primaryWallet: UserWallet | undefined = wallets.find(w => w.is_primary);
+    if (!primaryWallet) {
+      return ctx.reply(
+        'You have no primary wallet set. Use /wallets to manage your wallets or /start to create one.'
+      );
+    }
+
+    try {
+      const tokenBalances = await getAllTokenBalances(primaryWallet.address);
+      
+      if (tokenBalances.length === 0) {
+        return ctx.reply('No token balances found in this wallet.');
+      }
+
+      let totalUsdValue = 0;
+      const balanceLines = tokenBalances.map((token: TokenBalance) => {
+        totalUsdValue += token.usdValue;
+        return `${token.symbol}: ${token.balance}\n≈ $${token.usdValue.toFixed(2)} USD`;
+      }).join('\n\n');
+
+      const portfolioMessage = `
+<b>💼 Your Base Portfolio</b>
+
+<code>
+${balanceLines}
+
+Total Value: $${totalUsdValue.toFixed(2)} USD
+</code>
+
+<b>🔍 Quick Actions:</b>
+• Send ETH
+• Swap tokens
+• Check gas prices
+`;
+
+      await ctx.reply(portfolioMessage, {
+        parse_mode: 'HTML' as ParseMode,
+        reply_markup: mainMenuKeyboard.reply_markup
+      });
+    } catch (error) {
+      console.error('Error fetching portfolio:', error);
+      await ctx.reply(
+        '❌ Error fetching your portfolio. Please try again later.\n' +
+        'If the problem persists, check your wallet connection.'
+      );
+    }
+  } catch (error) {
+    console.error('Portfolio command error:', error);
+    await ctx.reply('An error occurred while processing your portfolio request.');
+  }
+});
+
+// Command: /wallets
+bot.command('wallets', async (ctx) => {
+  try {
+    console.log('Wallets command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please manage your wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      return ctx.reply(
+        '❌ You have no wallets yet.\n\n' +
+        'Use /start to create your first wallet!'
+      );
+    }    
+    // Create a message with wallet info
+    let messageText = `<b>🏦 Your Wallets</b>\n\n`;
+    
+    // Create inline keyboard buttons for each wallet address
+    const addressButtons: { text: string, callback_data: string }[][] = [];
+    
+    wallets.forEach((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      
+      // Add wallet info to message
+      messageText += `${index + 1}. ${name}${isPrimary}\n`;
+      messageText += `   <code>${shortAddress}</code>\n\n`;
+      
+      // Add button to copy full address
+      addressButtons.push([
+        { text: `📋 Copy ${name} Address`, callback_data: `copy_address_${wallet.address}` }
+      ]);
+    });
+    
+    messageText += `<i>Click on a button to copy the full wallet address</i>\n`;
+    messageText += `<i>Or select an action below:</i>`;
+
+    await ctx.reply(
+      messageText,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...addressButtons,
+            [
+              { text: '➕ New Wallet', callback_data: 'new_wallet' },
+              { text: '🔄 Set Primary', callback_data: 'set_primary' }
+            ],
+            [
+              { text: '✏️ Rename', callback_data: 'rename_wallet' },
+              { text: '🗑️ Delete', callback_data: 'delete_wallet' }
+            ]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Wallets command error:', error);
+    await ctx.reply('An error occurred while processing your wallets request.');
+  }
+});
+
+// Command: /send
+bot.command('send', async (ctx) => {
+  try {
+    console.log('Send command received directly');
+    await ctx.reply(
+      '<b>💸 How to Send ETH</b>\n\n' +
+      'Use this format:\n' +
+      '<code>send [amount] ETH to @username</code>\n\n' +
+      'For example:\n' +
+      '<code>send 0.1 ETH to @john</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Make sure you have enough ETH for gas\n' +
+      '• Double-check the recipient username\n' +
+      '• Verify transaction details before signing',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Send command error:', error);
+    await ctx.reply('An error occurred while processing your send request.');
+  }
+});
+
+// Command: /swap
+bot.command('swap', async (ctx) => {
+  try {
+    console.log('Swap command received directly');
+    await ctx.reply(
+      '<b>🔄 How to Swap Tokens</b>\n\n' +
+      'Use this format:\n' +
+      '<code>buy [amount] [token] with [amount] ETH</code>\n\n' +
+      'For example:\n' +
+      '<code>buy 50 USDC with 0.05 ETH</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Check token prices before swapping\n' +
+      '• Watch for slippage on large trades\n' +
+      '• Consider gas fees in your calculations',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Swap command error:', error);
+    await ctx.reply('An error occurred while processing your swap request.');
+  }
+});
+
+// Command: /gas
+bot.command('gas', async (ctx) => {
+  try {
+    console.log('Gas command received directly');
+    try {
+      const feeData = await provider.getFeeData();
+      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice;
+      
+      if (!maxFeePerGas) {
+        throw new Error('Could not get gas price');
+      }
+
+      const gasMessage = `
+<b>⛽️ Current Base Gas Prices</b>
+
+<code>
+Max Fee:     ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei
+Priority:    ${feeData.maxPriorityFeePerGas ? ethers.formatUnits(feeData.maxPriorityFeePerGas, 'gwei') : 'N/A'} Gwei
+</code>
+
+<i>💡 Gas prices on Base are typically very low!</i>
+
+Estimated costs:
+• ETH Transfer: ~0.0001 ETH
+• Token Swap: ~0.0003 ETH
+`;
+
+      await ctx.reply(gasMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('Error fetching gas prices:', error);
+      await ctx.reply(
+        '❌ Error fetching gas prices. Please try again later.\n' +
+        'If the problem persists, there may be network issues.'
+      );
+    }
+  } catch (error) {
+    console.error('Gas command error:', error);
+    await ctx.reply('An error occurred while processing your gas price request.');
+  }
+});
+
+// Command: /newwallet
+bot.command('newwallet', async (ctx) => {
+  try {
+    console.log('New wallet command received directly');
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }    
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for security reasons, please create wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (wallets.length >= 5) {
+      return ctx.reply(
+        '❌ Maximum wallet limit reached (5).\n\n' +
+        'Use /wallets to manage your existing wallets.'
+      );
+    }
+
+    const wallet = generateWallet();
+    const walletNumber = wallets.length + 1;
+    
+    const storedWallet = await createWallet({
+      telegram_id: user.telegram_id,
+      address: wallet.address,
+      name: `Wallet ${walletNumber}`,
+      is_primary: false
+    });
+
+    if (!storedWallet) {
+      return ctx.reply('❌ Error creating wallet. Please try again.');
+    }
+
+    const sensitiveInfo = await ctx.reply(
+      `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
+      `<b>Wallet Address:</b>\n` +
+      `<code>${wallet.address}</code>\n\n` +
+      `<b>Private Key:</b>\n` +
+      `<code>${wallet.privateKey}</code>\n\n` +
+      `<b>Backup Phrase:</b>\n` +
+      `<code>${wallet.mnemonic}</code>\n\n` +
+      `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
+      `Copy and store this information securely NOW!`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
+          ]]
+        }
+      }
+    );
+
+    if (ctx.session) {
+      ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
+    } else {
+      console.warn('Session is undefined in handler when setting sensitiveMessageId');
+    }
+  } catch (error) {
+    console.error('New wallet command error:', error);
+    await ctx.reply('An error occurred while creating a new wallet.');
+  }
+});
+
+// Command: /help
+bot.command('help', async (ctx) => {
+  try {
+    console.log('Help command received directly');
+    await ctx.reply(
+      `<b>🤖 BaseBuddy Help Guide</b>\n\n` +
+      `<b>Available Commands:</b>\n\n` +
+      `/start - Create your first wallet\n` +
+      `/portfolio - View your wallet balances\n` +
+      `/wallets - Manage your wallets\n` +
+      `/newwallet - Create additional wallet\n` +
+      `/send - Send ETH to others\n` +
+      `/swap - Swap tokens on Base\n` +
+      `/gas - Check current gas prices\n` +
+      `/help - Show this help message\n\n` +
+      `<b>Quick Commands:</b>\n` +
+      `• <code>send 0.1 ETH to @user</code>\n` +
+      `• <code>buy 50 USDC with 0.1 ETH</code>\n\n` +
+      `<b>Need More Help?</b>\n` +
+      `• Use each command to see detailed instructions\n` +
+      `• Keep your wallet details safe\n` +
+      `• Never share your private keys\n\n` +
+      `<i>🔐 For security, use private chat for sensitive operations</i>`,
+      { 
+        parse_mode: 'HTML',
+        reply_markup: mainMenuKeyboard.reply_markup
+      }
+    );
+  } catch (error) {
+    console.error('Help button error:', error);
+    await ctx.reply('An error occurred while processing your help request.');
+  }
+});
+
+// Handle wallet action callbacks
+bot.action('confirm_wallet_save', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    if (ctx.session && ctx.session.sensitiveMessageId) {
+      try {
+        // Delete the sensitive information immediately
+        await ctx.deleteMessage(ctx.session.sensitiveMessageId);
+        delete ctx.session.sensitiveMessageId;
+        
+        await ctx.reply(
+          '✅ Wallet details deleted. Make sure you\'ve saved them securely.\n\n' +
+          'Use /wallets to manage your wallets or view your /portfolio.'
+        );
+      } catch (error) {
+        console.error('Error deleting sensitive message:', error);
+        await ctx.reply('❌ Could not delete the message. Please delete it manually.');
+      }
+    }
+    await ctx.answerCbQuery('Wallet details deleted for security');
+  });
+});
+
+// Set primary wallet handler
+bot.action('set_primary', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Please use /start to create your account first');
+      return;
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      await ctx.answerCbQuery('You have no wallets to set as primary');
+      return;
+    }
+
+    const walletButtons = wallets.map((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Current Primary)' : '';
+      return [{
+        text: `${name}${isPrimary}`,
+        callback_data: `set_primary_${wallet.id}`
+      }];
+    });
+
+    await ctx.editMessageText(
+      '<b>🔄 Select Primary Wallet</b>\n\n' +
+      'Choose which wallet to set as your primary wallet:\n\n' +
+      'The primary wallet will be used for:\n' +
+      '• Sending ETH\n' +
+      '• Swapping tokens\n' +
+      '• Viewing portfolio\n\n' +
+      '<i>Click on a wallet to set it as primary:</i>',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...walletButtons,
+            [{ text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }]
+          ]
+        }
+      }
+    );
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle specific wallet selection for primary
+bot.action(/^set_primary_(.+)$/, async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const match = ctx.match[1]; // Get wallet ID
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Error: Could not find user');
+      return;
+    }
+
+    try {
+      const success = await setWalletAsPrimary(user.telegram_id, match);
+      
+      if (success) {
+        const wallet = await getWalletById(match);
+        const address = wallet ? `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}` : 'wallet';
+        
+        await ctx.editMessageText(
+          `✅ Successfully set ${address} as your primary wallet.\n\n` +
+          'This wallet will now be used for all transactions.',
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }
+              ]]
+            }
+          }
+        );
+      } else {
+        throw new Error('Failed to set primary wallet');
+      }
+    } catch (error) {
+      console.error('Error setting primary wallet:', error);
+      await ctx.editMessageText(
+        '❌ Error setting primary wallet. Please try again.',
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }
+            ]]
+          }
+        }
+      );
+    }
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle back to wallets menu action
+bot.action('back_to_wallets', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Error: Could not find user');
+      return;
+    }    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      await ctx.editMessageText(
+        '❌ You have no wallets yet.\n\n' +
+        'Use /start to create your first wallet!'
+      );
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    // Create a message with wallet info
+    let messageText = `<b>🏦 Your Wallets</b>\n\n`;
+    
+    // Create inline keyboard buttons for each wallet address
+    const addressButtons: { text: string, callback_data: string }[][] = [];
+    
+    wallets.forEach((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      
+      // Add wallet info to message
+      messageText += `${index + 1}. ${name}${isPrimary}\n`;
+      messageText += `   <code>${shortAddress}</code>\n\n`;
+      
+      // Add button to copy full address
+      addressButtons.push([
+        { text: `📋 Copy ${name} Address`, callback_data: `copy_address_${wallet.address}` }
+      ]);
+    });
+    
+    messageText += `<i>Click on a button to copy the full wallet address</i>\n`;
+    messageText += `<i>Or select an action below:</i>`;
+
+    await ctx.editMessageText(
+      messageText,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...addressButtons,
+            [
+              { text: '➕ New Wallet', callback_data: 'new_wallet' },
+              { text: '🔄 Set Primary', callback_data: 'set_primary' }
+            ],
+            [
+              { text: '✏️ Rename', callback_data: 'rename_wallet' },
+              { text: '🗑️ Delete', callback_data: 'delete_wallet' }
+            ]
+          ]
+        }
+      }
+    );
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle delete wallet action
+bot.action('delete_wallet', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Please use /start to create your account first');
+      return;
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      await ctx.answerCbQuery('You have no wallets to delete');
+      return;
+    }
+
+    const walletButtons = wallets.map((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      return [{
+        text: `${name}${isPrimary} - ${shortAddress}`,
+        callback_data: `delete_wallet_${wallet.id}`
+      }];
+    });
+
+    await ctx.editMessageText(
+      '<b>🗑️ Delete Wallet</b>\n\n' +
+      '⚠️ <b>WARNING:</b> This action cannot be undone!\n\n' +
+      'Make sure you have:\n' +
+      '• Backed up your private keys\n' +
+      '• Transferred any remaining funds\n' +
+      '• Selected the correct wallet\n\n' +
+      '<i>Select a wallet to delete:</i>',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...walletButtons,
+            [{ text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }]
+          ]
+        }
+      }
+    );
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle specific wallet deletion
+bot.action(/^delete_wallet_(.+)$/, async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const match = ctx.match[1]; // Get wallet ID
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Error: Could not find user');
+      return;
+    }
+
+    // Confirm deletion with a second step
+    await ctx.editMessageText(
+      '⚠️ <b>Confirm Wallet Deletion</b>\n\n' +
+      'Are you absolutely sure you want to delete this wallet?\n\n' +
+      'This action CANNOT be undone!\n' +
+      'Make sure you have backed up your private keys and transferred any remaining funds.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '❌ Cancel', callback_data: 'back_to_wallets' },
+              { text: '✅ Yes, Delete Wallet', callback_data: `confirm_delete_${match}` }
+            ]
+          ]
+        }
+      }
+    );
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle deletion confirmation
+bot.action(/^confirm_delete_(.+)$/, async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const match = ctx.match[1]; // Get wallet ID
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Error: Could not find user');
+      return;
+    }
+
+    try {
+      const success = await deleteWallet(user.telegram_id, match);
+      
+      if (success) {
+        await ctx.editMessageText(
+          '✅ Wallet successfully deleted.\n\n' +
+          'Remember to remove this wallet from any connected apps or services.',
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }
+              ]]
+            }
+          }
+        );
+      } else {
+        throw new Error('Failed to delete wallet');
+      }
+    } catch (error) {
+      console.error('Error deleting wallet:', error);
+      await ctx.editMessageText(
+        '❌ Error deleting wallet. Please try again.',
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }
+            ]]
+          }
+        }
+      );
+    }
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle keyboard button actions
+bot.hears('💼 My Portfolio', async (ctx) => {
+  try {
+    console.log('Portfolio button pressed directly');
+    // Use same implementation as portfolio command
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please check your portfolio in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    // Get user's primary wallet
+    const wallets: UserWallet[] = await getUserWallets(user.telegram_id);
+    const primaryWallet: UserWallet | undefined = wallets.find(w => w.is_primary);
+    if (!primaryWallet) {
+      return ctx.reply(
+        'You have no primary wallet set. Use /wallets to manage your wallets or /start to create one.'
+      );
+    }
+
+    try {
+      const tokenBalances = await getAllTokenBalances(primaryWallet.address);
+      
+      if (tokenBalances.length === 0) {
+        return ctx.reply('No token balances found in this wallet.');
+      }
+
+      let totalUsdValue = 0;
+      const balanceLines = tokenBalances.map((token: TokenBalance) => {
+        totalUsdValue += token.usdValue;
+        return `${token.symbol}: ${token.balance}\n≈ $${token.usdValue.toFixed(2)} USD`;
+      }).join('\n\n');
+
+      const portfolioMessage = `
+<b>💼 Your Base Portfolio</b>
+
+<code>
+${balanceLines}
+
+Total Value: $${totalUsdValue.toFixed(2)} USD
+</code>
+
+<b>🔍 Quick Actions:</b>
+• Send ETH
+• Swap tokens
+• Check gas prices
+`;
+
+      await ctx.reply(portfolioMessage, {
+        parse_mode: 'HTML' as ParseMode,
+        reply_markup: mainMenuKeyboard.reply_markup
+      });
+    } catch (error) {
+      console.error('Error fetching portfolio:', error);
+      await ctx.reply(
+        '❌ Error fetching your portfolio. Please try again later.\n' +
+        'If the problem persists, check your wallet connection.'
+      );
+    }
+  } catch (error) {
+    console.error('Portfolio button error:', error);
+    await ctx.reply('An error occurred while processing your portfolio request.');
+  }
+});
+
+bot.hears('🏦 My Wallets', async (ctx) => {
+  try {
+    console.log('Wallets button pressed directly');
+    // Same implementation as wallets command
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    // In groups, redirect to DM
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for privacy reasons, please manage your wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      return ctx.reply(
+        '❌ You have no wallets yet.\n\n' +
+        'Use /start to create your first wallet!'
+      );
+    }
+
+    // Create a message with wallet info
+    let messageText = `<b>🏦 Your Wallets</b>\n\n`;
+    
+    // Create inline keyboard buttons for each wallet address
+    const addressButtons: { text: string, callback_data: string }[][] = [];
+    
+    wallets.forEach((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      
+      // Add wallet info to message
+      messageText += `${index + 1}. ${name}${isPrimary}\n`;
+      messageText += `   <code>${shortAddress}</code>\n\n`;
+      
+      // Add button to copy full address
+      addressButtons.push([
+        { text: `📋 Copy ${name} Address`, callback_data: `copy_address_${wallet.address}` }
+      ]);
+    });
+    
+    messageText += `<i>Click on a button to copy the full wallet address</i>\n`;
+    messageText += `<i>Or select an action below:</i>`;
+
+    await ctx.reply(
+      messageText,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...addressButtons,
+            [
+              { text: '➕ New Wallet', callback_data: 'new_wallet' },
+              { text: '🔄 Set Primary', callback_data: 'set_primary' }
+            ],
+            [
+              { text: '✏️ Rename', callback_data: 'rename_wallet' },
+              { text: '🗑️ Delete', callback_data: 'delete_wallet' }
+            ]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Wallets button error:', error);
+    await ctx.reply('An error occurred while processing your wallets request.');
+  }
+});
+
+bot.hears('💸 Send ETH', async (ctx) => {
+  try {
+    console.log('Send ETH button pressed directly');
+    await ctx.reply(
+      '<b>💸 How to Send ETH</b>\n\n' +
+      'Use this format:\n' +
+      '<code>send [amount] ETH to @username</code>\n\n' +
+      'For example:\n' +
+      '<code>send 0.1 ETH to @john</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Make sure you have enough ETH for gas\n' +
+      '• Double-check the recipient username\n' +
+      '• Verify transaction details before signing',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Send ETH button error:', error);
+    await ctx.reply('An error occurred while processing your send request.');
+  }
+});
+
+bot.hears('🔄 Swap Tokens', async (ctx) => {
+  try {
+    console.log('Swap button pressed directly');
+    await ctx.reply(
+      '<b>🔄 How to Swap Tokens</b>\n\n' +
+      'Use this format:\n' +
+      '<code>buy [amount] [token] with [amount] ETH</code>\n\n' +
+      'For example:\n' +
+      '<code>buy 50 USDC with 0.05 ETH</code>\n\n' +
+      '💡 Tips:\n' +
+      '• Check token prices before swapping\n' +
+      '• Watch for slippage on large trades\n' +
+      '• Consider gas fees in your calculations',
+      { parse_mode: 'HTML' }
+    );
+  } catch (error) {
+    console.error('Swap button error:', error);
+    await ctx.reply('An error occurred while processing your swap request.');
+  }
+});
+
+bot.hears('📊 Gas Prices', async (ctx) => {
+  try {
+    console.log('Gas button pressed directly');
+    try {
+      const feeData = await provider.getFeeData();
+      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice;
+      
+      if (!maxFeePerGas) {
+        throw new Error('Could not get gas price');
+      }
+
+      const gasMessage = `
+<b>⛽️ Current Base Gas Prices</b>
+
+<code>
+Max Fee:     ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei
+Priority:    ${feeData.maxPriorityFeePerGas ? ethers.formatUnits(feeData.maxPriorityFeePerGas, 'gwei') : 'N/A'} Gwei
+</code>
+
+<i>💡 Gas prices on Base are typically very low!</i>
+
+Estimated costs:
+• ETH Transfer: ~0.0001 ETH
+• Token Swap: ~0.0003 ETH
+`;
+
+      await ctx.reply(gasMessage, { parse_mode: 'HTML' });
+    } catch (error) {
+      console.error('Error fetching gas prices:', error);
+      await ctx.reply(
+        '❌ Error fetching gas prices. Please try again later.\n' +
+        'If the problem persists, there may be network issues.'
+      );
+    }
+  } catch (error) {
+    console.error('Gas button error:', error);
+    await ctx.reply('An error occurred while processing your gas price request.');
+  }
+});
+
+bot.hears('➕ New Wallet', async (ctx) => {
+  try {
+    console.log('New Wallet button pressed directly');
+    // Same implementation as newwallet command
+    const username = ctx.from?.username;
+    const chatType = ctx.chat?.type;
+
+    if (!username) {
+      return ctx.reply('Error: Could not identify user');
+    }
+    
+    if (chatType !== 'private') {
+      const options = ctx.message?.message_thread_id 
+        ? { message_thread_id: ctx.message.message_thread_id }
+        : undefined;
+      return ctx.reply(
+        `@${username}, for security reasons, please create wallets in our private chat.`,
+        options
+      );
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      return ctx.reply('Please use /start to create your account first.');
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (wallets.length >= 5) {
+      return ctx.reply(
+        '❌ Maximum wallet limit reached (5).\n\n' +
+        'Use /wallets to manage your existing wallets.'
+      );
+    }
+
+    const wallet = generateWallet();
+    const walletNumber = wallets.length + 1;
+    
+    const storedWallet = await createWallet({
+      telegram_id: user.telegram_id,
+      address: wallet.address,
+      name: `Wallet ${walletNumber}`,
+      is_primary: false
+    });
+
+    if (!storedWallet) {
+      return ctx.reply('❌ Error creating wallet. Please try again.');
+    }
+
+    const sensitiveInfo = await ctx.reply(
+      `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
+      `<b>Wallet Address:</b>\n` +
+      `<code>${wallet.address}</code>\n\n` +
+      `<b>Private Key:</b>\n` +
+      `<code>${wallet.privateKey}</code>\n\n` +
+      `<b>Backup Phrase:</b>\n` +
+      `<code>${wallet.mnemonic}</code>\n\n` +
+      `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
+      `Copy and store this information securely NOW!`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
+          ]]
+        }
+      }
+    );
+
+    if (ctx.session) {
+      ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
+    } else {
+      console.warn('Session is undefined in handler when setting sensitiveMessageId');
+    }
+  } catch (error) {
+    console.error('New wallet button error:', error);
+    await ctx.reply('An error occurred while creating a new wallet.');
+  }
+});
+
+bot.hears('❓ Help', async (ctx) => {
+  try {
+    console.log('Help button pressed directly');
+    await ctx.reply(
+      `<b>🤖 BaseBuddy Help Guide</b>\n\n` +
+      `<b>Available Commands:</b>\n\n` +
+      `/start - Create your first wallet\n` +
+      `/portfolio - View your wallet balances\n` +
+      `/wallets - Manage your wallets\n` +
+      `/newwallet - Create additional wallet\n` +
+      `/send - Send ETH to others\n` +
+      `/swap - Swap tokens on Base\n` +
+      `/gas - Check current gas prices\n` +
+      `/help - Show this help message\n\n` +
+      `<b>Quick Commands:</b>\n` +
+      `• <code>send 0.1 ETH to @user</code>\n` +
+      `• <code>buy 50 USDC with 0.1 ETH</code>\n\n` +
+      `<b>Need More Help?</b>\n` +
+      `• Use each command to see detailed instructions\n` +
+      `• Keep your wallet details safe\n` +
+      `• Never share your private keys\n\n` +
+      `<i>🔐 For security, use private chat for sensitive operations</i>`,
+      { 
+        parse_mode: 'HTML',
+        reply_markup: mainMenuKeyboard.reply_markup
+      }
+    );
+  } catch (error) {
+    console.error('Help button error:', error);
+    await ctx.reply('An error occurred while processing your help request.');
+  }
+});
+
+// Handle copy address action
+bot.action(/^copy_address_(.+)$/, async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const address = ctx.match[1];
+    
+    if (!address) {
+      await ctx.answerCbQuery('Error: No wallet address found');
+      return;
+    }
+
+    // Send the address as a separate message so it's easy to copy
+    await ctx.reply(
+      `<code>${address}</code>\n\nCopy address to clipboard!`,
+      { parse_mode: 'HTML' }
+    );
+    
+    await ctx.answerCbQuery('Copy address to clipboard!');
+  });
+});
+
+// Handle new wallet action 
+bot.action('new_wallet', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Please use /start to create your account first');
+      return;
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (wallets.length >= 5) {
+      await ctx.answerCbQuery('Maximum wallet limit reached (5)');
+      await ctx.reply(
+        '❌ Maximum wallet limit reached (5).\n\n' +
+        'Use /wallets to manage your existing wallets.'
+      );
+      return;
+    }
+
+    // Redirect to the newwallet command
+    await ctx.answerCbQuery('Creating new wallet...');
+    await newWalletCommandHandler(ctx);
+  });
+});
+
+// Handle rename wallet action
+
+
+bot.action('rename_wallet', async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    const user = await getUserByTelegramUsername(username);
+    if (!user) {
+      await ctx.answerCbQuery('Please use /start to create your account first');
+      return;
+    }
+
+    const wallets = await getUserWallets(user.telegram_id);
+    if (!wallets.length) {
+      await ctx.answerCbQuery('You have no wallets to rename');
+      return;
+    }
+
+    const walletButtons = wallets.map((wallet, index) => {
+      const name = wallet.name || `Wallet ${index + 1}`;
+      const isPrimary = wallet.is_primary ? ' (Primary)' : '';
+      const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
+      return [{
+        text: `${name}${isPrimary} - ${shortAddress}`,
+        callback_data: `select_rename_${wallet.id}`
+      }];
+    });
+
+    await ctx.editMessageText(
+      '<b>✏️ Rename Wallet</b>\n\n' +
+      'Choose which wallet to rename:\n\n' +
+      '<i>Select a wallet:</i>',
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            ...walletButtons,
+            [{ text: '« Back to Wallet Menu', callback_data: 'back_to_wallets' }]
+          ]
+        }
+      }
+    );
+    await ctx.answerCbQuery();
+  });
+});
+
+// Handle wallet selection for rename
+bot.action(/^select_rename_(.+)$/, async (ctx) => {
+  await handleCommand(ctx, async () => {
+    const walletId = ctx.match[1];
+    const username = ctx.from?.username;
+    
+    if (!username) {
+      await ctx.answerCbQuery('Error: Could not identify user');
+      return;
+    }
+
+    // Verify the wallet exists before starting the rename process
+    const wallet = await getWalletById(walletId);
+    if (!wallet) {
+      console.error(`[WALLET RENAME] Wallet with ID ${walletId} not found before rename`);
+      await ctx.answerCbQuery('Error: Wallet not found');
+      return;
+    }
+
+    // Store the wallet ID in the session
+    if (ctx.session) {
+      ctx.session.renameWalletId = walletId;
+      console.log(`[WALLET RENAME] Set renameWalletId in session: ${walletId}`);
+    } else {
+      console.error('[WALLET RENAME] Session is undefined when trying to save renameWalletId');
+      await ctx.answerCbQuery('Session error. Please try again or restart with /start');
+      return;
+    }
+    
+    await ctx.reply(
+      '<b>✏️ Enter New Wallet Name</b>\n\n' +
+      'Please reply with the new name for your wallet.\n\n' +
+      '💡 Tips:\n' +
+      '• Use a short, memorable name\n' +
+      '• Names help identify your different wallets\n' +
+      '• Example: "Main", "Savings", "Trading", etc.\n\n' +
+      '✅ Simply type the new name and send it as your next message.',
+      { parse_mode: 'HTML' }
+    );
+    
+    await ctx.answerCbQuery('Please enter new wallet name');
+  });
+});
+
+// Handle text input for wallet rename
+bot.use(async (ctx: BotContext & { update: { message?: { text?: string } } }, next) => {  // Pass through if it's not a text message or no rename in progress
+  if (!('message' in ctx.update) ||
+      !ctx.update.message ||
+      !('text' in ctx.update.message) ||
+      !ctx.update.message.text ||
+      !ctx.session?.renameWalletId) {
+    await next();
+    return;
+  }
+
+  const walletId = ctx.session.renameWalletId;
+  console.log(`[WALLET RENAME] Processing rename for wallet ID: ${walletId}`);
+
+  try {
+    // Get the exact user-provided name and clean it up
+    const newName = ctx.update.message.text.trim();
+      
+    // Check if the name matches a timestamp pattern
+    if (newName.match(/Renamed Wallet \d+/)) {
+      console.warn(`[WALLET RENAME] User tried to use a timestamp pattern name: ${newName}`);
+      await ctx.reply(
+        '⚠️ Names with format "Renamed Wallet [numbers]" are reserved for system use.\n\n' +
+        'Please provide a different name like "Trading", "Savings", etc.\n' +
+        'Use /wallets to return to wallet management.'
+      );
+      delete ctx.session.renameWalletId;
+      return;
+    }
+      
+    // Validate name
+    if (newName.length === 0 || newName.length > 20) {
+      await ctx.reply(
+        '❌ Invalid wallet name.\n\n' +
+        'Please provide a name between 1 and 20 characters.\n' +
+        'Use /wallets to return to wallet management.'
+      );
+      delete ctx.session.renameWalletId;
+      return;
+    }
+      
+    // Get the wallet to show its old name
+    const wallet = await getWalletById(walletId);
+      
+    if (!wallet) {
+      console.error(`[WALLET RENAME] Wallet not found with ID: ${walletId}`);
+      await ctx.reply(
+        '❌ Error: Wallet not found.\n\n' +
+        'Please use /wallets to return to wallet management.'
+      );
+      delete ctx.session.renameWalletId;
+      return;
+    }
+
+    const oldName = wallet.name || `Wallet`;
+      
+    // Update the wallet name with the exact name provided by the user
+    console.log(`[WALLET RENAME] Attempting to rename wallet ${walletId} from "${oldName}" to "${newName}"`);
+    await ctx.reply(`Renaming wallet... Please wait.`);
+      
+    const success = await renameWallet(walletId, newName);
+      
+    if (success) {
+      console.log(`[WALLET RENAME] Successfully renamed wallet ${walletId}`);
+      // Verify the wallet was renamed successfully
+      const updatedWallet = await getWalletById(walletId);
+      if (updatedWallet) {
+        console.log(`[WALLET RENAME] Verification - wallet after rename:`, updatedWallet);
+          
+        if (updatedWallet.name === newName) {
+          console.log(`[WALLET RENAME] Verification successful - name updated to "${newName}"`);
+            
+          await ctx.reply(
+            `✅ Wallet successfully renamed from "${oldName}" to "${newName}".\n\n` +
+            'Use /wallets to see your updated wallet list.'
+          );
+        } else {
+          console.warn(`[WALLET RENAME] Verification failed - name is "${updatedWallet.name}" instead of "${newName}"`);
+            
+          await ctx.reply(
+            `⚠️ Warning: Wallet was renamed, but there may be an issue.\n\n` +
+            `Expected: "${newName}"\n` +
+            `Actual: "${updatedWallet.name || 'No name'}"\n\n` +
+            'Please use /wallets to verify your wallet name and try again if needed.'
+          );
+        }
+      } else {
+        await ctx.reply(
+          `✅ Wallet renamed, but couldn't verify the new name.\n\n` +
+          'Use /wallets to see your updated wallet list.'
+        );
+      }
+    } else {
+      console.error(`[WALLET RENAME] Failed to rename wallet ${walletId}`);
+      await ctx.reply(
+        '❌ Error renaming wallet.\n\n' +
+        'Please try again or use /wallets to return to wallet management.'
+      );
+    }
+      
+    // Clear the session
+    delete ctx.session.renameWalletId;
+  } catch (error) {      
+    console.error('[WALLET RENAME] Error processing wallet rename:', error);
+    await ctx.reply('An error occurred while renaming your wallet.');
+    // Clear the session to avoid getting stuck
+    if (ctx.session) {
+      delete ctx.session.renameWalletId;
+    }
+    return;
+  }
+
+  await next();
+});
+
+// Function to rename a wallet
+async function renameWallet(walletId: string, newName: string): Promise<boolean> {
+  try {
+    console.log(`[WALLET RENAME] Calling updateWalletName with walletId=${walletId}, newName=${newName}`);
+    
+    // Input validation
+    if (!walletId || typeof walletId !== 'string') {
+      console.error(`[WALLET RENAME] Invalid walletId: ${walletId}`);
+      return false;
+    }
+
+    // We want to use exactly what the user typed, just trimmed of whitespace
+    const exactName = newName.trim();
+    
+    if (!exactName || exactName.length > 20) {
+      console.error(`[WALLET RENAME] Invalid wallet name: ${exactName}`);
+      return false;
+    }
+      // Validate the wallet exists before updating
+    const existingWallet = await getWalletById(walletId);
+    if (!existingWallet) {
+      console.error(`[WALLET RENAME] Cannot rename wallet with ID ${walletId} because it doesn't exist`);
+      return false;
+    }
+    
+    console.log(`[WALLET RENAME] Found existing wallet: ${existingWallet.name} -> ${exactName}`);
+    
+    // Call the Supabase function to update the wallet name with the exact name
+    const result = await updateWalletName(walletId, exactName);
+    
+    console.log(`[WALLET RENAME] updateWalletName result: ${result}`);
+      // Double-check that the update was successful by fetching the wallet again
+    if (result) {
+      const updatedWallet = await getWalletById(walletId);
+      console.log(`[WALLET RENAME] Updated wallet name check:`, updatedWallet?.name);
+      
+      // If the name wasn't actually updated, log a warning but still return true
+      // since the database operation succeeded
+      if (updatedWallet && updatedWallet.name !== exactName) {
+        console.warn(`[WALLET RENAME] Wallet name wasn't updated correctly. Expected "${exactName}" but got "${updatedWallet.name}"`);
+      } else if (updatedWallet) {
+        console.log(`[WALLET RENAME] Verification successful: wallet name updated to "${exactName}"`);
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    console.error('[WALLET RENAME] Database error during wallet rename:', error);
+    return false;
+  }
+}
+
+// Token balance type definition
+interface TokenBalance {
+  symbol: string;
+  balance: string;
+  usdValue: number;
+}
+
+// Helper function to get all token balances
+async function getAllTokenBalances(address: string): Promise<TokenBalance[]> {
+  try {
+    const ethBalance = await getTokenBalance(address);
+    const ethPrice = 2000; // For demo, hardcoded ETH price
+
+    return [{
+      symbol: 'ETH',
+      balance: ethBalance,
+      usdValue: parseFloat(ethBalance) * ethPrice
+    }];
+  } catch (error) {
+    console.error('Error fetching token balances:', error);
+    return [];
+  }
+}
+
+// Helper function to generate swap link
+function generateSwapLink(fromToken: string, toToken: string, amount: string): string {
+  const baseUrl = 'https://app.uniswap.org/#/swap';
+  const chainId = process.env.BASE_CHAIN_ID;
+  
+  const params = new URLSearchParams({
+    chain: 'base',
+    inputCurrency: fromToken === 'ETH' ? 'ETH' : `${fromToken}`,
+    outputCurrency: toToken === 'ETH' ? 'ETH' : `${toToken}`,
+    exactAmount: amount
+  });
+
+  return `${baseUrl}?${params.toString()}`;
+}
+
+// Start the bot
+startBot().catch(err => {
+  console.error('Fatal error during startup:', err);
+  process.exit(1);
+});

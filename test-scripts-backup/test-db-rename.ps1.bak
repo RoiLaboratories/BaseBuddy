@@ -1,0 +1,26 @@
+# Test script for directly testing the database rename functionality
+Write-Host "Testing Database Wallet Rename Functionality" -ForegroundColor Cyan
+Write-Host "---------------------------------------" -ForegroundColor Cyan
+
+# Load environment variables from .env file
+$envPath = Join-Path $PSScriptRoot ".env"
+if (Test-Path $envPath) {
+    Write-Host "Loading environment variables from .env file..." -ForegroundColor Yellow
+    Get-Content $envPath | ForEach-Object {
+        if ($_ -match "^\s*([^#][^=]+)=(.*)$") {
+            $key = $matches[1].Trim()
+            $value = $matches[2].Trim()
+            [Environment]::SetEnvironmentVariable($key, $value)
+            Write-Host "Set environment variable: $key" -ForegroundColor Green
+        }
+    }
+} else {
+    Write-Host "ERROR: .env file not found." -ForegroundColor Red
+    exit 1
+}
+
+# Run the TypeScript test script
+Write-Host "`nExecuting test script to verify database rename functionality..." -ForegroundColor Green
+npx ts-node -r dotenv/config ./test-wallet-rename.ts
+
+Write-Host "`nTest completed!" -ForegroundColor Cyan

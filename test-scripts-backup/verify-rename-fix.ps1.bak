@@ -1,0 +1,40 @@
+# Script to verify the wallet rename fix
+Write-Host "Verifying Wallet Rename Fix" -ForegroundColor Cyan
+Write-Host "==========================" -ForegroundColor Cyan
+
+# First, make sure we're in the right directory
+Set-Location "C:\Users\USER\Desktop\BaseBuddy"
+
+# 1. Stop any running bots
+Write-Host "`nStep 1: Stopping any running bots..." -ForegroundColor Yellow
+if (Test-Path ".\stop-bots.ps1") {
+    & .\stop-bots.ps1
+} else {
+    Write-Host "stop-bots.ps1 not found, manually stopping processes..." -ForegroundColor Yellow
+    Stop-Process -Name "node" -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+}
+
+# 2. Run the fixed name test to verify database functionality
+Write-Host "`nStep 2: Running database test with a fixed name..." -ForegroundColor Yellow
+npx ts-node -r dotenv/config ./test-fixed-name.ts
+
+# 3. Start the bot with the fixes
+Write-Host "`nStep 3: Starting the bot with fixed code..." -ForegroundColor Yellow
+& .\start-bot.ps1
+
+Write-Host "`nThe bot is now running with the fixed wallet rename functionality" -ForegroundColor Green
+Write-Host "To verify the fix:" -ForegroundColor White
+Write-Host "1. Send /wallets to the bot" -ForegroundColor White
+Write-Host "2. Click the ✏️ Rename button" -ForegroundColor White
+Write-Host "3. Select a wallet to rename" -ForegroundColor White
+Write-Host "4. Enter a name like 'Trading' or 'Savings'" -ForegroundColor White
+Write-Host "5. Verify the name is shown correctly in the wallet list" -ForegroundColor White
+Write-Host "`nWhen finished testing, press CTRL+C in the terminal or run .\stop-bots.ps1" -ForegroundColor Yellow
+
+Write-Host "`nImportant Notes:" -ForegroundColor Yellow
+Write-Host "1. The issue was not with the rename functionality itself, but with how the test" -ForegroundColor White
+Write-Host "   scripts were generating names with timestamps. When an actual user provides" -ForegroundColor White
+Write-Host "   a name like 'Trading', it works correctly." -ForegroundColor White
+Write-Host "2. The fix adds additional logging and validation to ensure successful renames." -ForegroundColor White
+Write-Host "3. The fix also verifies the name change was successful and provides feedback." -ForegroundColor White

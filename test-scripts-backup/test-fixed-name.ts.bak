@@ -1,0 +1,141 @@
+// Test script to verify the wallet rename functionality with a fixed name
+import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+import { v4 as uuidv4 } from 'uuid';
+
+// Load environment variables
+dotenv.config();
+
+const supabaseUrl = process.env.SUPABASE_URL!;
+const supabaseKey = process.env.SUPABASE_KEY!;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing Supabase configuration in .env file');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+interface UserWallet {
+  id: string;
+  telegram_id: string;
+  address: string;
+  name?: string;
+  is_primary: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+async function updateWalletName(walletId: string, newName: string): Promise<boolean> {
+  console.log(`Updating wallet ${walletId} with new name: ${newName}`);
+  
+  try {
+    const { data, error } = await supabase
+      .from('wallets')
+      .update({ name: newName })
+      .eq('id', walletId)
+      .select();
+    
+    if (error) {
+      console.error('Error updating wallet name:', error);
+      return false;
+    }
+    
+    console.log(`Wallet update response:`, data);
+    return data && data.length > 0;
+  } catch (err) {
+    console.error('Exception in updateWalletName:', err);
+    return false;
+  }
+}
+
+async function testWalletRenameFunction() {
+  console.log('TESTING WALLET RENAME FUNCTIONALITY WITH FIXED NAME');
+  console.log('==================================================');
+  
+  // 1. First, let's fetch an existing wallet
+  console.log('1. Fetching existing wallets...');
+  
+  const { data: wallets, error: fetchError } = await supabase
+    .from('wallets')
+    .select('*')
+    .limit(1);
+  
+  let walletToRename: any = null;
+  
+  if (fetchError || !wallets || wallets.length === 0) {
+    console.error('Error fetching wallets or no wallets found:', fetchError);
+    
+    // If no wallets exist, let's create a test wallet
+    console.log('Creating a test wallet for rename testing...');
+    
+    const testWalletId = uuidv4();
+    const testWallet = {
+      id: testWalletId,
+      telegram_id: 'test_user_123',
+      address: '0x' + '0123456789abcdef'.repeat(2),
+      name: 'Test Wallet',
+      is_primary: false
+    };
+    
+    const { data: createdWallet, error: createError } = await supabase
+      .from('wallets')
+      .insert([testWallet])
+      .select();
+    
+    if (createError || !createdWallet || createdWallet.length === 0) {
+      console.error('Failed to create test wallet:', createError);
+      return;
+    }
+    
+    console.log('Successfully created test wallet:', createdWallet[0]);
+    walletToRename = createdWallet[0];
+  } else {
+    console.log('Found existing wallet:', wallets[0]);
+    walletToRename = wallets[0];
+  }
+  
+  const oldName = walletToRename.name || 'Unnamed Wallet';
+  const newName = 'Trading Wallet'; // Fixed name instead of a timestamp
+  
+  // 2. Now test renaming the wallet
+  console.log(`\n2. Renaming wallet from "${oldName}" to "${newName}"...`);
+  
+  const success = await updateWalletName(walletToRename.id, newName);
+  
+  if (success) {
+    console.log('✅ Wallet rename successful!');
+    
+    // 3. Verify the wallet was renamed
+    console.log('\n3. Verifying wallet name was updated...');
+    
+    const { data: updatedWallet, error: verifyError } = await supabase
+      .from('wallets')
+      .select('*')
+      .eq('id', walletToRename.id)
+      .single();
+    
+    if (verifyError || !updatedWallet) {
+      console.error('Error verifying wallet update:', verifyError);
+    } else {
+      console.log('Updated wallet:', updatedWallet);
+      
+      if (updatedWallet.name === newName) {
+        console.log('✅ VERIFICATION SUCCESSFUL: Wallet name was updated correctly to "Trading Wallet"!');
+      } else {
+        console.error(`❌ VERIFICATION FAILED: Wallet name is "${updatedWallet.name}" instead of "${newName}"`);
+      }
+    }
+  } else {
+    console.error('❌ Wallet rename failed!');
+  }
+}
+
+// Run the test
+testWalletRenameFunction()
+  .catch(error => {
+    console.error('Test failed with error:', error);
+  })
+  .finally(() => {
+    console.log('\nTest complete.');
+  });

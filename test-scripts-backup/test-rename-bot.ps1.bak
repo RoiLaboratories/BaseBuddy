@@ -1,0 +1,50 @@
+# Script to test wallet rename functionality in the BaseBuddy bot
+
+Write-Host "Testing wallet renaming in BaseBuddy Telegram Bot" -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor Cyan
+
+# Step 1: Add more logging to the key files
+Write-Host "`nStep 1: Adding detailed logging to the relevant files..." -ForegroundColor Yellow
+
+# First, make sure we're in the right directory
+Set-Location "C:\Users\USER\Desktop\BaseBuddy"
+
+# Step 2: Run the bot with extra debugging
+Write-Host "`nStep 2: Starting the bot with debug logs..." -ForegroundColor Yellow
+
+# Kill any existing node processes to ensure a clean start
+Write-Host "Stopping any existing bot processes..." -ForegroundColor Gray
+Stop-Process -Name "node" -ErrorAction SilentlyContinue
+
+# Set environment variables for more verbose logging
+$env:DEBUG = "telegraf:*,supabase:*,wallet:*"
+
+# Start the bot
+Write-Host "Starting bot in debug mode..." -ForegroundColor Green
+Start-Process -FilePath "npx" -ArgumentList "ts-node src/telegramBot.ts" -NoNewWindow
+
+# Wait a bit for the bot to initialize
+Write-Host "Waiting for bot to initialize..." -ForegroundColor Gray
+Start-Sleep -Seconds 5
+
+Write-Host "`nBot is now running in debug mode" -ForegroundColor Green
+Write-Host "Please test the rename wallet functionality in Telegram" -ForegroundColor Green
+Write-Host "Instructions:" -ForegroundColor White
+Write-Host "1. Use /wallets command in the bot" -ForegroundColor White
+Write-Host "2. Click on the '✏️ Rename' button" -ForegroundColor White
+Write-Host "3. Select a wallet to rename" -ForegroundColor White
+Write-Host "4. Enter a new name for the wallet" -ForegroundColor White
+Write-Host "5. Verify the new name is displayed correctly" -ForegroundColor White
+Write-Host "`nPress Ctrl+C to stop the bot when finished testing" -ForegroundColor Yellow
+
+# Keep the script running until manually stopped
+try {
+    while ($true) {
+        Start-Sleep -Seconds 1
+    }
+} finally {
+    # Clean up when script is interrupted
+    Write-Host "`nStopping the bot..." -ForegroundColor Gray
+    Stop-Process -Name "node" -ErrorAction SilentlyContinue
+    Write-Host "Test completed" -ForegroundColor Cyan
+}
