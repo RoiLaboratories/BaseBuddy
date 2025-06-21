@@ -18,12 +18,18 @@ function getMessageType(message: Message): string {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const startTime = Date.now();
   
+  // Verify the request is from Telegram
+  const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (!telegramToken) {
+    console.error('[Webhook] TELEGRAM_BOT_TOKEN is not set');
+    return res.status(500).json({ error: 'Configuration error' });
+  }
+
   console.log('[Webhook] Request received:', {
     timestamp: new Date().toISOString(),
     method: req.method,
     headers: req.headers,
-    bodySize: req.body ? JSON.stringify(req.body).length : 0,
-    body: process.env.NODE_ENV === 'development' ? req.body : undefined
+    bodySize: req.body ? JSON.stringify(req.body).length : 0
   });
 
   // Handle preflight requests

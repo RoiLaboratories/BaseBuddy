@@ -24,9 +24,9 @@
       "methods": ["GET", "OPTIONS"],
       "dest": "/api/test.ts"
     }
-  ],
-  "env": {
-    "NODE_ENV": "production"
+  ],  "env": {
+    "NODE_ENV": "production",
+    "VERCEL_ENV": "production"
   },
   "regions": ["cdg1"]
 }

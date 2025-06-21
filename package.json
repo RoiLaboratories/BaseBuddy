@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc",
     "vercel-build": "tsc",
+    "setup-webhook": "ts-node scripts/setup-webhook.ts",
     "start": "node dist/telegramBot.js",
     "dev": "nodemon --exec ts-node --transpile-only src/telegramBot.ts",
     "dev:debug": "nodemon --exec ts-node --files src/telegramBot.ts",
