@@ -1,15 +1,16 @@
 {
-  "compilerOptions": {    "target": "es2020",
+  "compilerOptions": {
+    "target": "es2020",
     "module": "commonjs",
     "moduleResolution": "node",
-    "noImplicitAny": false,
-    "strict": false,
     "esModuleInterop": true,
+    "allowJs": true,
+    "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
     "outDir": "./dist",
     "baseUrl": ".",
-    "resolveJsonModule": true,
     "paths": {
       "@/*": ["src/*"]
     },

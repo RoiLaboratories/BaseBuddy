@@ -6,10 +6,10 @@
   "scripts": {
     "build": "tsc",
     "vercel-build": "tsc",
-    "setup-webhook": "node --loader ts-node/esm scripts/setup-webhook.ts",
+    "setup-webhook": "ts-node scripts/setup-webhook.ts",
     "start": "node dist/telegramBot.js",
-    "dev": "node --loader ts-node/esm src/telegramBot.ts",
-    "dev:debug": "node --inspect --loader ts-node/esm src/telegramBot.ts",
+    "dev": "ts-node src/telegramBot.ts",
+    "dev:debug": "node --inspect -r ts-node/register src/telegramBot.ts",
     "test": "echo \"Error: no test specified\"; exit 1",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
