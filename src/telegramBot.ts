@@ -1,5 +1,6 @@
 // Fixed version of telegramBot.ts - resolved command handler issues
 import { Telegraf, Context, session } from 'telegraf';
+import { Message, Update } from 'telegraf/types';
 import { ethers } from 'ethers';
 import { 
   getUserByTelegramUsername, 
@@ -20,8 +21,10 @@ import { XMTPAgent } from './xmtpAgent';
 import { generateWallet } from './utils/generate-wallet';
 import dotenv from 'dotenv';
 
+// Load environment variables
 dotenv.config();
 
+// Validate required environment variables
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error('TELEGRAM_BOT_TOKEN is required');
 }
@@ -30,21 +33,30 @@ if (!process.env.BASE_RPC_URL) {
   throw new Error('BASE_RPC_URL is required');
 }
 
-const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL);
+// Initialize provider
+const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || '');
 
 // Custom session type
-interface BotSession {
+interface SessionData {
   sensitiveMessageId?: number;
   renameWalletId?: string;
 }
 
-// Extend context type to include session
-interface BotContext extends Context {
-  session: BotSession;
+// Define custom context type
+interface BotContext extends Context<Update> {
+  session: SessionData;
 }
 
+// Create bot instance with typed context
+const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
+
+// Initialize session middleware
+bot.use(session({ defaultSession: () => ({}) }));
+
+// Export the bot instance and provider
+export { bot, provider };
+
 // Bot setup
-export const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 const xmtpAgent = new XMTPAgent();
 
 // Configure session support
@@ -925,20 +937,24 @@ bot.action('delete_cancel', async (ctx) => {
  * - In private chat: send [amount] [token] to @username
  * - In groups: @BaseBuddy send [amount] [token] to @username
  */
-bot.on('text', async (ctx) => {
+bot.on('text', async (ctx: BotContext) => {
   try {
-    const message = ctx.message.text;
+    if (!ctx.message || !('text' in ctx.message)) {
+      return;
+    }
+
+    const text = ctx.message.text;
     const chatType = ctx.chat?.type;
     
     // For groups, only respond to messages that mention the bot
-    if (chatType !== 'private' && !message.includes(`@${ctx.botInfo?.username}`)) {
+    if (chatType !== 'private' && !text.includes(`@${ctx.botInfo?.username}`)) {
       return;
     }
 
     // Remove bot mention from message in groups
     const cleanMessage = chatType !== 'private' 
-      ? message.replace(`@${ctx.botInfo?.username}`, '').trim()
-      : message;
+      ? text.replace(`@${ctx.botInfo?.username}`, '').trim()
+      : text;
 
     // Handle token transfers
     const sendMatch = cleanMessage.match(/^send ([\d.]+) (ETH|[A-Z]+) to @(\w+)/i);
@@ -1020,8 +1036,7 @@ bot.on('text', async (ctx) => {
         { parse_mode: 'HTML' }
       );
       
-      try {
-        // Execute the transfer directly from the user's wallet
+      try {        // Execute the transfer directly from the user's wallet
         const result = await executeTransfer(
           senderPrimary.address,
           recipientPrimary.address,
@@ -1030,6 +1045,10 @@ bot.on('text', async (ctx) => {
         );
 
         // Delete progress message
+        if (!ctx.chat) {
+          console.error('Chat context is undefined');
+          return;
+        }
         await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
 
         // Send success message to user
@@ -1038,9 +1057,12 @@ bot.on('text', async (ctx) => {
           `Successfully sent ${result.amount} ${result.token} to @${recipient}\n\n` +
           `<b>Transaction Hash:</b> <code>${result.hash}</code>`,
           msgOptions
-        );
-      } catch (error: unknown) {
+        );      } catch (error: unknown) {
         // Delete progress message
+        if (!ctx.chat) {
+          console.error('Chat context is undefined');
+          return;
+        }
         await ctx.telegram.deleteMessage(ctx.chat.id, progressMsg.message_id).catch(() => {});
         
         // Send error message to user
