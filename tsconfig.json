@@ -1,9 +1,9 @@
 {
-  "compilerOptions": {    "target": "es2022",
-    "module": "es2022",
-    "lib": ["es2022"],
+  "compilerOptions": {    "target": "es2020",
+    "module": "commonjs",
     "moduleResolution": "node",
-    "strict": true,
+    "noImplicitAny": false,
+    "strict": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,

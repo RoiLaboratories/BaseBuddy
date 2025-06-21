@@ -1,5 +1,6 @@
 // Fixed version of telegramBot.ts - resolved command handler issues
 import { Telegraf, Context, session } from 'telegraf';
+import { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/typings/core/types/typegram';
 import { Message, Update } from 'telegraf/types';
 import { ethers } from 'ethers';
 import { 
@@ -316,9 +317,8 @@ bot.command('portfolio', async (ctx) => {
 
     try {
       const tokenBalances = await getAllTokenBalances(primaryWallet.address);
-      
-      // Filter out zero balances
-      const nonZeroBalances = tokenBalances.filter(token => 
+        // Filter out zero balances
+      const nonZeroBalances = tokenBalances.filter((token: TokenBalance) => 
         parseFloat(token.balance) > 0
       );
       
@@ -399,7 +399,7 @@ bot.command('wallets', async (ctx) => {
         'Use /start to create your first wallet!'
       );
     }    // Generate wallet list with copy buttons
-    const inlineKeyboard = [];
+    const inlineKeyboard: InlineKeyboardButton[][] = [];
     const walletsList = wallets.map((wallet, index) => {
       const name = wallet.name || `Wallet ${index + 1}`;
       const isPrimary = wallet.is_primary ? ' (Primary)' : '';
@@ -1242,14 +1242,21 @@ startBot();
 
 // Initialize bot and verify token
 console.log('[Bot] Initializing...');
-const botInfo = await bot.telegram.getMe();
-console.log('[Bot] Initialized successfully:', {
-  timestamp: new Date().toISOString(),
-  username: botInfo.username,
-  id: botInfo.id,
-  can_join_groups: botInfo.can_join_groups,
-  can_read_all_group_messages: botInfo.can_read_all_group_messages
-});
+(async () => {
+  try {
+    const botInfo = await bot.telegram.getMe();
+    console.log('[Bot] Initialized successfully:', {
+      timestamp: new Date().toISOString(),
+      username: botInfo.username,
+      id: botInfo.id,
+      can_join_groups: botInfo.can_join_groups,
+      can_read_all_group_messages: botInfo.can_read_all_group_messages
+    });
+  } catch (error) {
+    console.error('[Bot] Initialization failed:', error);
+    process.exit(1);
+  }
+})();
 
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx) => {
