@@ -2,6 +2,9 @@ import { type VercelRequest, type VercelResponse } from '@vercel/node';
 import { bot } from '../src/telegramBot';
 import { Message, Update } from 'telegraf/types';
 
+// Ensure bot is initialized with commands
+import '../src/telegramBot';
+
 function getUpdateType(update: Update): string {
   if ('message' in update) return 'message';
   if ('callback_query' in update) return 'callback_query';

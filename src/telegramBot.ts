@@ -50,19 +50,30 @@ interface BotContext extends Context<Update> {
 // Create bot instance with typed context
 const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 
-// Initialize session middleware
-bot.use(session({ defaultSession: () => ({}) }));
-
-// Export the bot instance and provider
-export { bot, provider };
-
 // Bot setup
 const xmtpAgent = new XMTPAgent();
 
-// Configure session support
+// Configure session support with debug logging
 bot.use(session({
   defaultSession: () => ({ sensitiveMessageId: undefined })
 }));
+
+// Debug middleware to log all updates
+bot.use(async (ctx, next) => {
+  console.log('Received update:', {
+    type: ctx.updateType,
+    chat: ctx.chat?.type,
+    from: ctx.from?.username,    message: ctx.message ? {
+      type: 'text' in ctx.message ? 'text' : 'non-text',
+      messageId: ctx.message.message_id
+    } : undefined
+  });
+  await next();
+  console.log('Finished processing update');
+});
+
+// Export the bot instance and provider
+export { bot, provider };
 
 // Enable debug logging
 bot.use(async (ctx, next) => {
@@ -1123,26 +1134,24 @@ const startBot = async () => {
     // Setup bot metadata first
     await setupBot();
     
-    // Configure webhook mode for serverless deployment
-    if (process.env.VERCEL_ENV) {
-      const webhookUrl = `${process.env.VERCEL_URL}/api/webhook`;
-      console.log('Setting webhook URL:', webhookUrl);
-      await bot.telegram.setWebhook(webhookUrl);
-    } else {
-      console.log('Starting bot in development mode...');
+    // In development, use long polling. In production, webhook is handled by api/webhook.ts
+    if (!process.env.VERCEL_ENV) {
+      console.log('Starting bot in development mode (polling)...');
       await bot.launch();
       console.log('🚀 Bot is running in development mode...');
-    }
 
-    // Enable graceful stop for development mode
-    process.once('SIGINT', () => {
-      bot.stop('SIGINT');
-      console.log('Bot stopped due to SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      bot.stop('SIGTERM');
-      console.log('Bot stopped due to SIGTERM');
-    });
+      // Enable graceful stop for development mode
+      process.once('SIGINT', () => {
+        bot.stop('SIGINT');
+        console.log('Bot stopped due to SIGINT');
+      });
+      process.once('SIGTERM', () => {
+        bot.stop('SIGTERM');
+        console.log('Bot stopped due to SIGTERM');
+      });
+    } else {
+      console.log('Bot configured for webhook mode in production');
+    }
   } catch (error) {
     console.error('Failed to start bot:', error);
     // Provide more detailed error information
@@ -1155,8 +1164,10 @@ const startBot = async () => {
 };
 
 // Run the bot
-startBot();
-
+startBot().catch(error => {
+  console.error('Failed to start bot:', error);
+  process.exit(1);
+});
 
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx) => {
