@@ -44,7 +44,7 @@ interface BotContext extends Context {
 }
 
 // Bot setup
-const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
+export const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 const xmtpAgent = new XMTPAgent();
 
 // Configure session support
