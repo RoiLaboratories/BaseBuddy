@@ -50,23 +50,60 @@ interface BotContext extends Context<Update> {
 // Create bot instance with typed context
 const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 
+// Initialize the bot and verify token
+const initBot = async () => {
+  const botInfo = await bot.telegram.getMe();
+  console.log('[Bot] Initialized successfully:', {
+    timestamp: new Date().toISOString(),
+    username: botInfo.username,
+    id: botInfo.id,
+    can_join_groups: botInfo.can_join_groups,
+    can_read_all_group_messages: botInfo.can_read_all_group_messages
+  });
+};
+
 // Initialize session middleware
 bot.use(session({ defaultSession: () => ({}) }));
 
 // Add logging middleware
 bot.use(async (ctx, next) => {
   const start = Date.now();
-  console.log('Received update:', {
+  const updateId = ctx.update.update_id;
+  
+  console.log('[Bot] Processing update:', {
+    timestamp: new Date().toISOString(),
+    update_id: updateId,
     type: ctx.updateType,
     from: ctx.from?.username,
-    chat: ctx.chat?.type,
+    chat_id: ctx.chat?.id,
+    chat_type: ctx.chat?.type,
     message: 'message' in ctx.update && ctx.update.message && 'text' in ctx.update.message ? ctx.update.message.text : undefined
   });
   
   try {
     await next();
+    const ms = Date.now() - start;
+    console.log('[Bot] Update processed:', {
+      timestamp: new Date().toISOString(),
+      update_id: updateId,
+      process_time: `${ms}ms`,
+      from: ctx.from?.username,
+      chat_id: ctx.chat?.id
+    });
   } catch (error) {
-    console.error('Error in bot middleware:', error);
+    const ms = Date.now() - start;
+    console.error('[Bot] Error in middleware:', {
+      timestamp: new Date().toISOString(),
+      update_id: updateId,
+      process_time: `${ms}ms`,
+      error: error instanceof Error ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      } : error,
+      from: ctx.from?.username,
+      chat_id: ctx.chat?.id
+    });
     // Try to notify user of error
     try {
       await ctx.reply('Sorry, something went wrong. Please try again.');
@@ -1203,6 +1240,17 @@ const startBot = async () => {
 // Run the bot
 startBot();
 
+// Initialize bot and verify token
+console.log('[Bot] Initializing...');
+const botInfo = await bot.telegram.getMe();
+console.log('[Bot] Initialized successfully:', {
+  timestamp: new Date().toISOString(),
+  username: botInfo.username,
+  id: botInfo.id,
+  can_join_groups: botInfo.can_join_groups,
+  can_read_all_group_messages: botInfo.can_read_all_group_messages
+});
+
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx) => {
   try {
@@ -1490,7 +1538,9 @@ bot.on('message', async (ctx) => {
 
 // Start the bot
 if (require.main === module) {
-  startBot().catch((error) => {
+  initBot()
+    .then(() => startBot())
+    .catch((error) => {
     console.error('Failed to start bot:', error);
     process.exit(1);
   });

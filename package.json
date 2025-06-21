@@ -1,5 +1,6 @@
 {
   "name": "basebuddy",
+  "type": "module",
   "version": "1.0.0",
   "description": "A Telegram bot for DeFi interactions on Base chain",
   "main": "dist/telegramBot.js",
