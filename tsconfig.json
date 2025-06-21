@@ -1,15 +1,26 @@
 {
-  "compilerOptions": {    "target": "es2020",
+  "compilerOptions": {
+    "target": "es2020",
     "module": "commonjs",
     "moduleResolution": "node",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,    "outDir": "./dist",    "baseUrl": ".",
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist",
+    "baseUrl": ".",
     "resolveJsonModule": true,
     "paths": {
       "@/*": ["src/*"]
-    }
-  },  "include": ["src/**/*", "api/**/*"],
-  "exclude": ["node_modules"]
+    },
+    "rootDir": "."
+  },
+  "include": [
+    "src/**/*",
+    "api/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
