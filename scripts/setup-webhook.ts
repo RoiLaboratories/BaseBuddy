@@ -13,12 +13,9 @@ const setupWebhook = async () => {
     if (!process.env.TELEGRAM_BOT_TOKEN) {
       throw new Error('TELEGRAM_BOT_TOKEN is not set');
     }
-    
-    if (!process.env.VERCEL_URL) {
-      throw new Error('VERCEL_URL is not set. Please deploy to Vercel first.');
-    }
-
-    if (!process.env.VERCEL_URL && !process.env.BASE_URL) {
+      // Get the base URL from either VERCEL_URL or BASE_URL
+    const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
+    if (!baseUrl) {
       throw new Error('Neither VERCEL_URL nor BASE_URL is set');
     }
 
@@ -26,17 +23,37 @@ const setupWebhook = async () => {
 
     // First, delete any existing webhook
     console.log('[Setup] Removing existing webhook...');
-    await bot.telegram.deleteWebhook();
+    await bot.telegram.deleteWebhook();    // Build the webhook URL - handle both with and without https:// prefix
+    const webhookUrl = baseUrl.startsWith('http') 
+      ? `${baseUrl}/api/webhook`
+      : `https://${baseUrl}/api/webhook`;
+    console.log('[Setup] Setting webhook URL:', webhookUrl);    // Set the new webhook with retry logic
+    let retryCount = 0;
+    const maxRetries = 3;
+    let success = false;
 
-    // Get the base URL
-    const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
-    const webhookUrl = `https://${baseUrl}/api/webhook`;
-    console.log('[Setup] Setting webhook URL:', webhookUrl);
+    while (!success && retryCount < maxRetries) {      try {
+        await bot.telegram.setWebhook(webhookUrl, {
+          drop_pending_updates: true
+        });
+        success = true;
+      } catch (error: any) {
+        if (error?.response?.error_code === 429) {
+          retryCount++;
+          const retryAfter = error.response?.parameters?.retry_after || 1;
+          console.log(`[Setup] Rate limited, waiting ${retryAfter} seconds before retry ${retryCount}/${maxRetries}...`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        } else {
+          throw error;
+        }
+      }
+    }
 
-    // Set the new webhook
-    await bot.telegram.setWebhook(webhookUrl, {
-      drop_pending_updates: true
-    });    // Verify the webhook
+    if (!success) {
+      throw new Error('Failed to set webhook after maximum retries');
+    }
+
+    // Verify the webhook
     const webhookInfo = await bot.telegram.getWebhookInfo();
     console.log('[Setup] Webhook info:', webhookInfo);
 
