@@ -1,42 +1,43 @@
 import { type VercelRequest, type VercelResponse } from '@vercel/node';
 import { bot } from '../src/telegramBot';
 
-// Add middleware to validate Telegram webhook
-const validateTelegramWebhook = (req: VercelRequest) => {
-  const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-  if (!telegramToken) {
-    throw new Error('TELEGRAM_BOT_TOKEN is not configured');
-  }
-  
-  // Optionally validate secret token header
-  // const secretHeader = req.headers['x-telegram-bot-api-secret-token'];
-  // if (!secretHeader || secretHeader !== process.env.WEBHOOK_SECRET) {
-  //   throw new Error('Invalid secret token');
-  // }
-  
-  return true;
-};
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  console.log('Received webhook request:', {
+    method: req.method,
+    headers: req.headers,
+    bodySize: req.body ? JSON.stringify(req.body).length : 0
+  });
+
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    return res.status(200).end();
+  }
+
+  // Verify request method
+  if (req.method !== 'POST') {
+    console.log('Invalid method:', req.method);
+    return res.status(405).json({
+      error: 'Method not allowed',
+      allowedMethods: ['POST']
+    });
+  }
+
   try {
-    // Handle preflight requests for CORS
-    if (req.method === 'OPTIONS') {
-      return res.status(200).end();
+    // Verify we have a request body
+    if (!req.body) {
+      console.log('No request body received');
+      return res.status(400).json({ error: 'No request body' });
     }
 
-    // Only allow POST requests
-    if (req.method !== 'POST') {
-      return res.status(405).json({ 
-        error: 'Method not allowed',
-        allowedMethods: ['POST']
-      });
-    }
-
-    // Validate the request
-    validateTelegramWebhook(req);
+    console.log('Processing update:', JSON.stringify(req.body));
 
     // Handle the update
     await bot.handleUpdate(req.body);
+    console.log('Update processed successfully');
+
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error('Webhook error:', error);
