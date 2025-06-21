@@ -1123,12 +1123,18 @@ const startBot = async () => {
     // Setup bot metadata first
     await setupBot();
     
-    console.log('Starting bot launch sequence...');
-    // Launch the bot
-    await bot.launch();
-    console.log('🚀 Bot is running...');
+    // Configure webhook mode for serverless deployment
+    if (process.env.VERCEL_ENV) {
+      const webhookUrl = `${process.env.VERCEL_URL}/api/webhook`;
+      console.log('Setting webhook URL:', webhookUrl);
+      await bot.telegram.setWebhook(webhookUrl);
+    } else {
+      console.log('Starting bot in development mode...');
+      await bot.launch();
+      console.log('🚀 Bot is running in development mode...');
+    }
 
-    // Enable graceful stop
+    // Enable graceful stop for development mode
     process.once('SIGINT', () => {
       bot.stop('SIGINT');
       console.log('Bot stopped due to SIGINT');
