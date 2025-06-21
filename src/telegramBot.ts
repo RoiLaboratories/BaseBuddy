@@ -50,34 +50,47 @@ interface BotContext extends Context<Update> {
 // Create bot instance with typed context
 const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 
-// Bot setup
-const xmtpAgent = new XMTPAgent();
+// Initialize session middleware
+bot.use(session({ defaultSession: () => ({}) }));
 
-// Configure session support with debug logging
-bot.use(session({
-  defaultSession: () => ({ sensitiveMessageId: undefined })
-}));
-
-// Debug middleware to log all updates
+// Add logging middleware
 bot.use(async (ctx, next) => {
+  const start = Date.now();
   console.log('Received update:', {
     type: ctx.updateType,
+    from: ctx.from?.username,
     chat: ctx.chat?.type,
-    from: ctx.from?.username,    message: ctx.message ? {
-      type: 'text' in ctx.message ? 'text' : 'non-text',
-      messageId: ctx.message.message_id
-    } : undefined
+    message: 'message' in ctx.update && ctx.update.message && 'text' in ctx.update.message ? ctx.update.message.text : undefined
   });
-  await next();
-  console.log('Finished processing update');
+  
+  try {
+    await next();
+  } catch (error) {
+    console.error('Error in bot middleware:', error);
+    // Try to notify user of error
+    try {
+      await ctx.reply('Sorry, something went wrong. Please try again.');
+    } catch (replyError) {
+      console.error('Could not send error message to user:', replyError);
+    }
+  }
+  
+  console.log('Response time:', Date.now() - start, 'ms');
 });
 
 // Export the bot instance and provider
 export { bot, provider };
 
+// Bot setup
+const xmtpAgent = new XMTPAgent();
+
+// Configure session support
+bot.use(session({
+  defaultSession: () => ({ sensitiveMessageId: undefined })
+}));
+
 // Enable debug logging
-bot.use(async (ctx, next) => {
-  const start = Date.now();
+bot.use(async (ctx, next) => {  const start = Date.now();
   const messageType = ctx.updateType || 'unknown';
   
   // Safely get message text from different types of messages
@@ -120,8 +133,7 @@ bot.catch(async (err: unknown, ctx: Context) => {
 const handleCommand = async (ctx: BotContext, commandHandler: () => Promise<any>) => {
   try {
     // Log which command is being executed
-    let commandText = 'unknown command';
-    if (ctx.message && 'text' in ctx.message) {
+    let commandText = 'unknown command';    if (ctx.message && 'text' in ctx.message && typeof ctx.message.text === 'string') {
       commandText = ctx.message.text;
     }
     console.log(`Executing command handler for: ${commandText}`);
@@ -948,9 +960,9 @@ bot.action('delete_cancel', async (ctx) => {
  * - In private chat: send [amount] [token] to @username
  * - In groups: @BaseBuddy send [amount] [token] to @username
  */
-bot.on('text', async (ctx: BotContext) => {
+bot.on('message', async (ctx) => {
   try {
-    if (!ctx.message || !('text' in ctx.message)) {
+    if (!('text' in ctx.message)) {
       return;
     }
 
@@ -1134,24 +1146,49 @@ const startBot = async () => {
     // Setup bot metadata first
     await setupBot();
     
-    // In development, use long polling. In production, webhook is handled by api/webhook.ts
-    if (!process.env.VERCEL_ENV) {
-      console.log('Starting bot in development mode (polling)...');
+    // Set up commands
+    await bot.telegram.setMyCommands([
+      { command: 'start', description: 'Start the bot' },
+      { command: 'help', description: 'Show help information' },
+      { command: 'createwallet', description: 'Create a new wallet' },
+      { command: 'wallets', description: 'List your wallets' },
+      { command: 'balances', description: 'Check your wallet balances' }
+    ]);
+    
+    // Configure webhook mode for serverless deployment
+    if (process.env.VERCEL_ENV || process.env.NODE_ENV === 'production') {
+      const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
+      if (!baseUrl) {
+        throw new Error('VERCEL_URL or BASE_URL is required in production');
+      }
+      
+      const webhookUrl = `https://${baseUrl}/api/webhook`;
+      console.log('Setting webhook URL:', webhookUrl);
+      
+      // Delete any existing webhook
+      await bot.telegram.deleteWebhook();
+      // Set the new webhook
+      const success = await bot.telegram.setWebhook(webhookUrl);
+      console.log('Webhook setup:', success ? 'successful' : 'failed');
+      
+      // Get and log webhook info
+      const webhookInfo = await bot.telegram.getWebhookInfo();
+      console.log('Webhook info:', webhookInfo);
+    } else {
+      console.log('Starting bot in development mode...');
       await bot.launch();
       console.log('🚀 Bot is running in development mode...');
-
-      // Enable graceful stop for development mode
-      process.once('SIGINT', () => {
-        bot.stop('SIGINT');
-        console.log('Bot stopped due to SIGINT');
-      });
-      process.once('SIGTERM', () => {
-        bot.stop('SIGTERM');
-        console.log('Bot stopped due to SIGTERM');
-      });
-    } else {
-      console.log('Bot configured for webhook mode in production');
     }
+
+    // Enable graceful stop for development mode
+    process.once('SIGINT', () => {
+      bot.stop('SIGINT');
+      console.log('Bot stopped due to SIGINT');
+    });
+    process.once('SIGTERM', () => {
+      bot.stop('SIGTERM');
+      console.log('Bot stopped due to SIGTERM');
+    });
   } catch (error) {
     console.error('Failed to start bot:', error);
     // Provide more detailed error information
@@ -1164,10 +1201,7 @@ const startBot = async () => {
 };
 
 // Run the bot
-startBot().catch(error => {
-  console.error('Failed to start bot:', error);
-  process.exit(1);
-});
+startBot();
 
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx) => {
@@ -1414,10 +1448,15 @@ bot.action('confirm_wallet_save', async (ctx) => {
 });
 
 // Handle rename wallet messages
-bot.on('text', async (ctx) => {
+bot.on('message', async (ctx) => {
   try {
     // Only handle messages in private chat and when a wallet is being renamed
     if (ctx.chat?.type !== 'private' || !ctx.session?.renameWalletId) {
+      return;
+    }
+
+    // Check if it's a text message
+    if (!('text' in ctx.message)) {
       return;
     }
 
@@ -1448,4 +1487,12 @@ bot.on('text', async (ctx) => {
     await ctx.reply('An error occurred while renaming the wallet.');
   }
 });
+
+// Start the bot
+if (require.main === module) {
+  startBot().catch((error) => {
+    console.error('Failed to start bot:', error);
+    process.exit(1);
+  });
+}
 
