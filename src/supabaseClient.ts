@@ -17,7 +17,7 @@ if (!supabaseUrl || !supabaseKey) {
   throw new Error('Missing Supabase configuration');
 }
 
-export const supabase = createClient('https://crkfczedmbamdysqmwdn.supabase.co', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNya2ZjemVkbWJhbWR5c3Ftd2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0OTIyOTI2OCwiZXhwIjoyMDY0ODA1MjY4fQ.pZWY-wkHB7OBtfto1HXJF1aE6qG0dsBiLDdqdCIyNPU', {
+export const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false

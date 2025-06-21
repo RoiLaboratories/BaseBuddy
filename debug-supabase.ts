@@ -26,7 +26,7 @@ console.log('\nCreating Supabase client with:');
 console.log('URL:', process.env.SUPABASE_URL);
 console.log('Key:', process.env.SUPABASE_KEY ? '[FOUND]' : '[MISSING]');
 
-const supabase = createClient('https://crkfczedmbamdysqmwdn.supabase.co', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNya2ZjemVkbWJhbWR5c3Ftd2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0OTIyOTI2OCwiZXhwIjoyMDY0ODA1MjY4fQ.pZWY-wkHB7OBtfto1HXJF1aE6qG0dsBiLDdqdCIyNPU', {
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_KEY!, {
   auth: {
     autoRefreshToken: false,
     persistSession: false
