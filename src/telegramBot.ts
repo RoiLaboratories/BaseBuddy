@@ -1,7 +1,8 @@
-// Fixed version of telegramBot.ts - resolved command handler issues
-import { Telegraf, Context, session } from 'telegraf';
-import { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/typings/core/types/typegram';
-import { Message, Update } from 'telegraf/types';
+// Bot initialization and configuration
+import { Context, Telegraf, session } from 'telegraf';
+import { CallbackQuery, Update, Message } from 'telegraf/typings/core/types/typegram';
+import { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/types';
+// No need for SessionFlavor, we'll use a simpler approach
 import { ethers } from 'ethers';
 import { 
   getUserByTelegramUsername, 
@@ -22,52 +23,61 @@ import { XMTPAgent } from './xmtpAgent';
 import { generateWallet } from './utils/generate-wallet';
 import dotenv from 'dotenv';
 
-// Load environment variables
+// Load environment variables and validate
 dotenv.config();
 
-// Validate required environment variables
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error('TELEGRAM_BOT_TOKEN is required');
 }
 
-if (!process.env.BASE_RPC_URL) {
-  throw new Error('BASE_RPC_URL is required');
-}
-
 // Initialize provider
 const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || '');
+export { provider };
 
-// Custom session type
+// Session typing
 interface SessionData {
+  state?: string;
+  wallet?: UserWallet;
+  token?: string;
+  amount?: string;
+  recipient?: string;
   sensitiveMessageId?: number;
   renameWalletId?: string;
 }
 
-// Define custom context type
-interface BotContext extends Context<Update> {
-  session: SessionData;
-}
-
-// Create bot instance with typed context
-const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
-
-// Initialize the bot and verify token
-const initBot = async () => {
-  const botInfo = await bot.telegram.getMe();
-  console.log('[Bot] Initialized successfully:', {
-    timestamp: new Date().toISOString(),
-    username: botInfo.username,
-    id: botInfo.id,
-    can_join_groups: botInfo.can_join_groups,
-    can_read_all_group_messages: botInfo.can_read_all_group_messages
-  });
+// Message type
+type TextMessage = {
+  message: {
+    text: string;
+    message_id: number;
+    chat: {
+      id: number;
+      type: string;
+    };
+  };
 };
 
-// Initialize session middleware
-bot.use(session({ defaultSession: () => ({}) }));
+// Import the necessary types from telegraf
+import type { Update as TelegrafUpdate, Message as TelegrafMessage } from 'telegraf/typings/core/types/typegram';
+
+// import type { Context } from 'telegraf';
+// Custom context type with all required properties
+interface BotContext extends Context<Update> {
+  session: SessionData;
+  match: RegExpExecArray | null;
+}
+
+// Initialize bot with proper error handling and session
+const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN, {
+  handlerTimeout: 90000 // Set timeout to 90s
+});
+export { bot };
+
+// Configure basic middleware
+bot.use(session());
 
 // Add logging middleware
-bot.use(async (ctx, next) => {
+bot.use(async (ctx: BotContext, next: () => Promise<void>) => {
   const start = Date.now();
   const updateId = ctx.update.update_id;
   
@@ -105,60 +115,102 @@ bot.use(async (ctx, next) => {
       from: ctx.from?.username,
       chat_id: ctx.chat?.id
     });
-    // Try to notify user of error
-    try {
-      await ctx.reply('Sorry, something went wrong. Please try again.');
-    } catch (replyError) {
-      console.error('Could not send error message to user:', replyError);
-    }
+    throw error; // Re-throw to let the error handler handle it
   }
-  
-  console.log('Response time:', Date.now() - start, 'ms');
 });
 
-// Export the bot instance and provider
-export { bot, provider };
-
-// Bot setup
-const xmtpAgent = new XMTPAgent();
-
-// Configure session support
-bot.use(session({
-  defaultSession: () => ({ sensitiveMessageId: undefined })
-}));
-
-// Enable debug logging
-bot.use(async (ctx, next) => {  const start = Date.now();
-  const messageType = ctx.updateType || 'unknown';
-  
-  // Safely get message text from different types of messages
-  let messageText = 'no text';
-  if (ctx.message && 'text' in ctx.message) {
-    messageText = ctx.message.text;
-  } else if (ctx.callbackQuery && 'data' in ctx.callbackQuery) {
-    messageText = `callback: ${ctx.callbackQuery.data}`;
+// Add error handler with detailed logging
+bot.catch((err: unknown, ctx: BotContext) => {
+  console.error('[Bot] Error while handling update:', err);
+  // Log the full error details
+  if (err instanceof Error) {
+    console.error('[Bot] Error details:', {
+      message: err.message,
+      stack: err.stack,
+      name: err.name
+    });
   }
-  
-  console.log(`Received [${messageType}]: ${messageText}`);
-  
+  ctx.reply('An error occurred while processing your request. Please try again.').catch(console.error);
+});
+
+// Bot initialization and startup
+const startBot = async () => {
   try {
-    await next();
-    const ms = Date.now() - start;
-    console.log(`Response time: ${ms}ms for [${messageType}]: ${messageText}`);
+    // Configure metadata
+    await setupBot();
+    
+    // Start in appropriate mode
+    if (process.env.NODE_ENV === 'production') {
+      // In production, we'll use webhooks
+      console.log('[Bot] Running in webhook mode');
+    } else {
+      // In development, use polling
+      await bot.launch();
+      console.log('[Bot] Running in polling mode');
+    }
+
+    const botInfo = await bot.telegram.getMe();
+    console.log('[Bot] Initialized successfully:', {
+      timestamp: new Date().toISOString(),
+      username: botInfo.username,
+      id: botInfo.id,
+      can_join_groups: botInfo.can_join_groups,
+      can_read_all_group_messages: botInfo.can_read_all_group_messages
+    });
   } catch (error) {
-    console.error(`Error processing [${messageType}]: ${messageText}`, error);
+    console.error('[Bot] Failed to initialize:', error);
     throw error;
   }
-});
+};
 
-// Session middleware
-bot.use(async (ctx, next) => {
-  ctx.session = ctx.session || {};
-  await next();
-});
+// Initialize bot startup
+const initializeBot = async () => {
+  try {
+    // Configure metadata
+    await setupBot();
+    
+    // Start in appropriate mode
+    if (process.env.NODE_ENV === 'production') {
+      // In production, we'll use webhooks
+      console.log('[Bot] Running in webhook mode');
+    } else {
+      // In development, use polling
+      await bot.launch();
+      console.log('[Bot] Running in polling mode');
+    }
+
+    const botInfo = await bot.telegram.getMe();
+    console.log('[Bot] Initialized successfully:', {
+      timestamp: new Date().toISOString(),
+      username: botInfo.username,
+      id: botInfo.id,
+      can_join_groups: botInfo.can_join_groups,
+      can_read_all_group_messages: botInfo.can_read_all_group_messages
+    });
+  } catch (error) {
+    console.error('[Bot] Failed to initialize:', error);
+    throw error;
+  }
+};
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Start bot if this file is run directly
+if (require.main === module) {
+  // Start in appropriate mode
+  startBot().catch((error: unknown) => {
+    console.error('Failed to start bot:', error);
+    process.exit(1);
+  });
+}
+
+// Initialize XMTP agent
+const xmtpAgent = new XMTPAgent();
 
 // Global error handler
-bot.catch(async (err: unknown, ctx: Context) => {
+bot.catch(async (err: unknown, ctx: BotContext) => {
   console.error('Bot error:', err);
   try {
     await ctx.reply('An error occurred while processing your request.');
@@ -197,11 +249,22 @@ const validateUser = async (username: string): Promise<{ user: UserProfile; erro
   }
 };
 
+// Helper to check if a message has text and narrow its type
+const hasText = (ctx: BotContext): ctx is BotContext & {
+  message: Message.TextMessage;
+} => {
+  return Boolean(
+    ctx.message && 
+    'text' in ctx.message &&
+    typeof ctx.message.text === 'string'
+  );
+};
+
 // COMMAND HANDLERS
 // ---------------
 
 // Command: /start
-bot.command('start', async (ctx) => {
+bot.command('start', async (ctx: BotContext) => {
   try {
     console.log('Start command received directly');
     const telegramId = ctx.from?.id.toString();
@@ -292,7 +355,7 @@ bot.command('start', async (ctx) => {
 });
 
 // Command: /portfolio
-bot.command('portfolio', async (ctx) => {
+bot.command('portfolio', async (ctx: BotContext) => {
   try {
     console.log('Portfolio command received directly');
     const username = ctx.from?.username;
@@ -367,7 +430,7 @@ ${totalUsdValue > 0 ? `\nTotal Value: $${totalUsdValue.toFixed(2)} USD` : ''}
 });
 
 // Command: /wallets
-bot.command('wallets', async (ctx) => {
+bot.command('wallets', async (ctx: BotContext) => {
   try {
     console.log('Wallets command received directly');
     const username = ctx.from?.username;
@@ -443,7 +506,7 @@ bot.command('wallets', async (ctx) => {
 });
 
 // Command: /send
-bot.command('send', async (ctx) => {
+bot.command('send', async (ctx: BotContext) => {
   try {
     console.log('Send command received directly');    await ctx.reply(      '<b>💸 How to Send Tokens</b>\n\n' +
       'Use this format:\n' +
@@ -468,7 +531,7 @@ bot.command('send', async (ctx) => {
 
 
 // Command: /gas
-bot.command('gas', async (ctx) => {
+bot.command('gas', async (ctx: BotContext) => {
   try {
     console.log('Gas command received directly');
     try {
@@ -509,7 +572,7 @@ Estimated costs:
 });
 
 // Command: /newwallet
-bot.command('newwallet', async (ctx) => {
+bot.command('newwallet', async (ctx: BotContext) => {
   try {
     console.log('New wallet command received directly');
     const username = ctx.from?.username;
@@ -584,7 +647,7 @@ bot.command('newwallet', async (ctx) => {
 });
 
 // Command: /help
-bot.command('help', async (ctx) => {
+bot.command('help', async (ctx: BotContext) => {
   try {
     console.log('Help command received directly');
     await ctx.reply(
@@ -620,8 +683,13 @@ bot.command('help', async (ctx) => {
 // Handle wallet action callbacks
 
 // Handle copy address callback
-bot.action(/^copy_(.+)$/, async (ctx) => {
+bot.action(/^copy_(.+)$/, async (ctx: BotContext) => {
   try {
+    if (!ctx.match) {
+      console.error('No match found in callback query');
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
     const walletId = ctx.match[1];
     const wallet = await getWalletById(walletId);
     
@@ -643,7 +711,7 @@ bot.action(/^copy_(.+)$/, async (ctx) => {
 });
 
 // Handle set primary wallet callback
-bot.action('set_primary', async (ctx) => {
+bot.action('set_primary', async (ctx: BotContext) => {
   try {
     const username = ctx.from?.username;
     if (!username) {
@@ -684,9 +752,20 @@ bot.action('set_primary', async (ctx) => {
 });
 
 // Handle primary wallet selection
-bot.action(/^primary_(.+)$/, async (ctx) => {
+bot.action(/^primary_(.+)$/, async (ctx: BotContext) => {
   try {
-    const walletId = ctx.match[1];
+    const callbackQuery = ctx.callbackQuery;
+    if (!callbackQuery || !('data' in callbackQuery)) {
+      console.error('No callback data found');
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
+    const walletId = callbackQuery.data.split('_')[1];
+    if (!walletId) {
+      console.error('No wallet ID found in callback data');
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
     const username = ctx.from?.username;
     
     if (!username) {
@@ -754,7 +833,7 @@ bot.action(/^primary_(.+)$/, async (ctx) => {
 });
 
 // Handle rename wallet callback
-bot.action('rename_wallet', async (ctx) => {
+bot.action('rename_wallet', async (ctx: BotContext) => {
   try {
     const username = ctx.from?.username;
     if (!username) {
@@ -795,22 +874,32 @@ bot.action('rename_wallet', async (ctx) => {
 });
 
 // Handle rename wallet selection
-bot.action(/^rename_select_(.+)$/, async (ctx) => {
+bot.action(/^rename_select_(.+)$/, async (ctx: BotContext) => {
   try {
-    const walletId = ctx.match[1];
-    const wallet = await getWalletById(walletId);
+    const query = ctx.callbackQuery;
+    if (!query || !('data' in query)) {
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
     
-    if (!wallet) {
+    const targetId = query.data.split('_')[2];
+    if (!targetId) {
+      await ctx.answerCbQuery('Invalid wallet ID');
+      return;
+    }
+
+    const targetWallet = await getWalletById(targetId);
+    if (!targetWallet) {
       await ctx.answerCbQuery('Wallet not found');
       return;
     }
 
-    ctx.session.renameWalletId = walletId;
+    ctx.session.renameWalletId = targetId;
 
     await ctx.reply(
       `<b>✏️ Rename Wallet</b>\n\n` +
-      `Current name: ${wallet.name || 'Unnamed Wallet'}\n` +
-      `Address: ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}\n\n` +
+      `Current name: ${targetWallet.name || 'Unnamed Wallet'}\n` +
+      `Address: ${targetWallet.address.slice(0, 6)}...${targetWallet.address.slice(-4)}\n\n` +
       `Reply with the new name for this wallet:`,
       { parse_mode: 'HTML' }
     );
@@ -822,7 +911,7 @@ bot.action(/^rename_select_(.+)$/, async (ctx) => {
 });
 
 // Handle delete wallet callback
-bot.action('delete_wallet', async (ctx) => {
+bot.action('delete_wallet', async (ctx: BotContext) => {
   try {
     const username = ctx.from?.username;
     if (!username) {
@@ -863,25 +952,35 @@ bot.action('delete_wallet', async (ctx) => {
 });
 
 // Handle delete wallet selection
-bot.action(/^delete_(.+)$/, async (ctx) => {
+bot.action(/^delete_(.+)$/, async (ctx: BotContext) => {
   try {
-    const walletId = ctx.match[1];
-    const wallet = await getWalletById(walletId);
+    const query = ctx.callbackQuery;
+    if (!query || !("data" in query)) {
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
     
-    if (!wallet) {
+    const deleteId = query.data.split('_')[1];
+    if (!deleteId) {
+      await ctx.answerCbQuery('Invalid wallet ID');
+      return;
+    }
+
+    const deleteWallet = await getWalletById(deleteId);
+    if (!deleteWallet) {
       await ctx.answerCbQuery('Wallet not found');
       return;
     }    await ctx.editMessageText(
       `<b>🗑️ Confirm Delete Wallet</b>\n\n` +
       `Are you sure you want to delete this wallet?\n\n` +
-      `Name: ${wallet.name || 'Unnamed Wallet'}\n` +
-      `Address: ${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`,
+      `Name: ${deleteWallet.name || 'Unnamed Wallet'}\n` +
+      `Address: ${deleteWallet.address.slice(0, 6)}...${deleteWallet.address.slice(-4)}`,
       {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [[
             { text: '❌ Cancel', callback_data: 'back_to_wallets' },
-            { text: '✅ Confirm Delete', callback_data: `confirm_delete_${walletId}` }
+            { text: '✅ Confirm Delete', callback_data: `confirm_delete_${deleteId}` }
           ]]
         }
       }
@@ -894,13 +993,22 @@ bot.action(/^delete_(.+)$/, async (ctx) => {
 });
 
 // Handle delete wallet confirmation
-bot.action(/^confirm_delete_(.+)$/, async (ctx) => {
+bot.action(/^confirm_delete_(.+)$/, async (ctx: BotContext) => {
   try {
-    const walletId = ctx.match[1];
+    const query = ctx.callbackQuery;
+    if (!query || !("data" in query)) {
+      await ctx.answerCbQuery('Invalid callback data');
+      return;
+    }
     
-    // Get the wallet before deleting to show confirmation details
-    const wallet = await getWalletById(walletId);
-    if (!wallet) {
+    const confirmId = query.data.split('_')[2];
+    if (!confirmId) {
+      await ctx.answerCbQuery('Invalid wallet ID');
+      return;
+    }
+
+    const confirmWallet = await getWalletById(confirmId);
+    if (!confirmWallet) {
       await ctx.answerCbQuery('❌ Wallet not found');
       return;
     }
@@ -917,7 +1025,7 @@ bot.action(/^confirm_delete_(.+)$/, async (ctx) => {
       return;
     }
 
-    const success = await deleteWallet(user.telegram_id, walletId);
+    const success = await deleteWallet(user.telegram_id, confirmId);
     if (success) {
       await ctx.reply('✅ Wallet deleted successfully');
       // Refresh the wallet list
@@ -970,7 +1078,7 @@ bot.action(/^confirm_delete_(.+)$/, async (ctx) => {
 });
 
 // Handle delete wallet cancellation
-bot.action('delete_cancel', async (ctx) => {
+bot.action('delete_cancel', async (ctx: BotContext) => {
   try {
     // Edit the message instead of sending a new one
     await ctx.editMessageText(
@@ -997,9 +1105,8 @@ bot.action('delete_cancel', async (ctx) => {
  * - In private chat: send [amount] [token] to @username
  * - In groups: @BaseBuddy send [amount] [token] to @username
  */
-bot.on('message', async (ctx) => {
-  try {
-    if (!('text' in ctx.message)) {
+bot.on('message', async (ctx: BotContext) => {
+  try {    if (!hasText(ctx)) {
       return;
     }
 
@@ -1153,10 +1260,12 @@ bot.on('message', async (ctx) => {
 
 // Bot setup function
 const setupBot = async () => {
-  try {    await bot.telegram.setMyDescription(
+  try {
+    await bot.telegram.setMyDescription(
       'BaseBuddy - Your DeFi companion on Base chain! Send and receive tokens and track your portfolio easily.'
     );
-      await bot.telegram.setMyCommands([
+    
+    await bot.telegram.setMyCommands([
       { command: 'start', description: 'Start the bot and create your first wallet' },
       { command: 'portfolio', description: 'View your portfolio' },
       { command: 'wallets', description: 'Manage your wallets' },
@@ -1176,90 +1285,16 @@ const setupBot = async () => {
   }
 };
 
-// Start bot function
-const startBot = async () => {
-  try {
-    console.log('Setting up bot metadata...');
-    // Setup bot metadata first
-    await setupBot();
-    
-    // Set up commands
-    await bot.telegram.setMyCommands([
-      { command: 'start', description: 'Start the bot' },
-      { command: 'help', description: 'Show help information' },
-      { command: 'createwallet', description: 'Create a new wallet' },
-      { command: 'wallets', description: 'List your wallets' },
-      { command: 'balances', description: 'Check your wallet balances' }
-    ]);
-    
-    // Configure webhook mode for serverless deployment
-    if (process.env.VERCEL_ENV || process.env.NODE_ENV === 'production') {
-      const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
-      if (!baseUrl) {
-        throw new Error('VERCEL_URL or BASE_URL is required in production');
-      }
-      
-      const webhookUrl = `https://${baseUrl}/api/webhook`;
-      console.log('Setting webhook URL:', webhookUrl);
-      
-      // Delete any existing webhook
-      await bot.telegram.deleteWebhook();
-      // Set the new webhook
-      const success = await bot.telegram.setWebhook(webhookUrl);
-      console.log('Webhook setup:', success ? 'successful' : 'failed');
-      
-      // Get and log webhook info
-      const webhookInfo = await bot.telegram.getWebhookInfo();
-      console.log('Webhook info:', webhookInfo);
-    } else {
-      console.log('Starting bot in development mode...');
-      await bot.launch();
-      console.log('🚀 Bot is running in development mode...');
-    }
-
-    // Enable graceful stop for development mode
-    process.once('SIGINT', () => {
-      bot.stop('SIGINT');
-      console.log('Bot stopped due to SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      bot.stop('SIGTERM');
-      console.log('Bot stopped due to SIGTERM');
-    });
-  } catch (error) {
-    console.error('Failed to start bot:', error);
-    // Provide more detailed error information
-    if (error instanceof Error && error.message && error.message.includes('409: Conflict')) {
-      console.error('ERROR: Another bot instance is already running!');
-      console.error('Please run the stop-bots.ps1 script to kill all running instances before starting again.');
-    }
+// Run the bot if this file is run directly
+if (require.main === module) {
+  startBot().catch((error: unknown) => {
+    console.error('[Bot] Failed to start:', error);
     process.exit(1);
-  }
-};
-
-// Run the bot
-startBot();
-
-// Initialize bot and verify token
-console.log('[Bot] Initializing...');
-(async () => {
-  try {
-    const botInfo = await bot.telegram.getMe();
-    console.log('[Bot] Initialized successfully:', {
-      timestamp: new Date().toISOString(),
-      username: botInfo.username,
-      id: botInfo.id,
-      can_join_groups: botInfo.can_join_groups,
-      can_read_all_group_messages: botInfo.can_read_all_group_messages
-    });
-  } catch (error) {
-    console.error('[Bot] Initialization failed:', error);
-    process.exit(1);
-  }
-})();
+  });
+}
 
 // Handle back to wallets action
-bot.action('back_to_wallets', async (ctx) => {
+bot.action('back_to_wallets', async (ctx: BotContext) => {
   try {
     const username = ctx.from?.username;
     if (!username) {
@@ -1328,7 +1363,7 @@ bot.action('back_to_wallets', async (ctx) => {
 });
 
 // Handle new wallet button
-bot.action('new_wallet', async (ctx) => {
+bot.action('new_wallet', async (ctx: BotContext) => {
   try {
     const username = ctx.from?.username;
     if (!username) {
@@ -1435,7 +1470,7 @@ bot.action('new_wallet', async (ctx) => {
 });
 
 // Handle wallet save confirmation
-bot.action('confirm_wallet_save', async (ctx) => {
+bot.action('confirm_wallet_save', async (ctx: BotContext) => {
   try {
     // Delete the sensitive information message
     if (ctx.session.sensitiveMessageId) {
@@ -1503,18 +1538,26 @@ bot.action('confirm_wallet_save', async (ctx) => {
 });
 
 // Handle rename wallet messages
-bot.on('message', async (ctx) => {
+bot.on('message', async (ctx: BotContext) => {
   try {
     // Only handle messages in private chat and when a wallet is being renamed
-    if (ctx.chat?.type !== 'private' || !ctx.session?.renameWalletId) {
+    if (
+      !ctx.message ||
+      ctx.chat?.type !== 'private' ||
+      !ctx.session?.renameWalletId ||
+      ctx.message?.hasOwnProperty('text') !== true
+    ) {
+      return;
+    }
+    // Type guard: only proceed if ctx.message is a text message
+    const textMsg = ctx.message as Message.TextMessage;
+    if (typeof textMsg.text !== 'string') {
       return;
     }
 
-    // Check if it's a text message
-    if (!('text' in ctx.message)) {
+    if (!('text' in ctx.message) || typeof ctx.message.text !== 'string') {
       return;
     }
-
     const newName = ctx.message.text.trim();
     if (newName.length > 50) {
       await ctx.reply('❌ Wallet name too long. Please use a shorter name (max 50 characters).');
@@ -1545,11 +1588,21 @@ bot.on('message', async (ctx) => {
 
 // Start the bot
 if (require.main === module) {
-  initBot()
-    .then(() => startBot())
-    .catch((error) => {
-    console.error('Failed to start bot:', error);
-    process.exit(1);
-  });
+  // Initialize bot
+  bot.telegram.getMe()
+    .then((botInfo) => {
+      console.log('[Bot] Initialized successfully:', {
+        timestamp: new Date().toISOString(),
+        username: botInfo.username,
+        id: botInfo.id,
+        can_join_groups: botInfo.can_join_groups,
+        can_read_all_group_messages: botInfo.can_read_all_group_messages
+      });
+      return startBot();
+    })
+    .catch((error: unknown) => {
+      console.error('Failed to start bot:', error);
+      process.exit(1);
+    });
 }
 
