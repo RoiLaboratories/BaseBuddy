@@ -34,6 +34,13 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || '');
 export { provider };
 
+// Bot initialization function
+// (Removed duplicate initializeBot function)
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
 // Session typing
 interface SessionData {
   state?: string;
@@ -134,7 +141,7 @@ bot.catch((err: unknown, ctx: BotContext) => {
 });
 
 // Bot initialization and startup
-export async function initializeBot() {
+const startBot = async () => {
   try {
     // Configure metadata
     await setupBot();
@@ -161,7 +168,7 @@ export async function initializeBot() {
     console.error('[Bot] Failed to initialize:', error);
     throw error;
   }
-}
+};
 
 // Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
@@ -169,7 +176,8 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
 // Start bot if this file is run directly
 if (require.main === module) {
-  initializeBot().catch((error: unknown) => {
+  // Start in appropriate mode
+  startBot().catch((error: unknown) => {
     console.error('Failed to start bot:', error);
     process.exit(1);
   });
@@ -505,113 +513,22 @@ bot.command('gas', async (ctx: BotContext) => {
     console.log('Gas command received directly');
     try {
       const feeData = await provider.getFeeData();
-      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice;
-      
-      if (!maxFeePerGas) {
-        throw new Error('Could not get gas price');
-      }
 
-      const gasMessage = `
-<b>⛽️ Current Base Gas Prices</b>
-
-<code>
-Max Fee:     ${ethers.formatUnits(maxFeePerGas, 'gwei')} Gwei
-Priority:    ${feeData.maxPriorityFeePerGas ? ethers.formatUnits(feeData.maxPriorityFeePerGas, 'gwei') : 'N/A'} Gwei
-</code>
-
-<i>💡 Gas prices on Base are typically very low!</i>
-
-Estimated costs:
-• ETH Transfer: ~0.0001 ETH
-• Token Transfer: ~0.0002 ETH
-`;
-
-      await ctx.reply(gasMessage, { parse_mode: 'HTML' });
-    } catch (error) {
-      console.error('Error fetching gas prices:', error);
+      // You can use feeData to show gas price info to the user
       await ctx.reply(
-        '❌ Error fetching gas prices. Please try again later.\n' +
-        'If the problem persists, there may be network issues.'
+        `<b>⛽ Current Gas Prices</b>\n\n` +
+        `Gas Price: <code>${feeData.gasPrice?.toString() || 'N/A'}</code>\n` +
+        `Max Fee Per Gas: <code>${feeData.maxFeePerGas?.toString() || 'N/A'}</code>\n` +
+        `Max Priority Fee Per Gas: <code>${feeData.maxPriorityFeePerGas?.toString() || 'N/A'}</code>`,
+        { parse_mode: 'HTML' }
       );
+    } catch (error) {
+      console.error('Gas command error:', error);
+      await ctx.reply('An error occurred while fetching gas prices.');
     }
   } catch (error) {
-    console.error('Gas command error:', error);
-    await ctx.reply('An error occurred while processing your gas price request.');
-  }
-});
-
-// Command: /newwallet
-bot.command('newwallet', async (ctx: BotContext) => {
-  try {
-    console.log('New wallet command received directly');
-    const username = ctx.from?.username;
-    const chatType = ctx.chat?.type;
-
-    if (!username) {
-      return ctx.reply('Error: Could not identify user');
-    }
-    
-    if (chatType !== 'private') {
-      const options = ctx.message?.message_thread_id 
-        ? { message_thread_id: ctx.message.message_thread_id }
-        : undefined;
-      return ctx.reply(
-        `@${username}, for security reasons, please create wallets in our private chat.`,
-        options
-      );
-    }
-
-    const user = await getUserByTelegramUsername(username);
-    if (!user) {
-      return ctx.reply('Please use /start to create your account first.');
-    }
-
-    const wallets = await getUserWallets(user.telegram_id);
-    if (wallets.length >= 5) {
-      return ctx.reply(
-        '❌ Maximum wallet limit reached (5).\n\n' +
-        'Use /wallets to manage your existing wallets.'
-      );
-    }
-
-    const wallet = generateWallet();
-    const walletNumber = wallets.length + 1;
-    
-    const storedWallet = await createWallet({
-      telegram_id: user.telegram_id,
-      address: wallet.address,
-      name: `Wallet ${walletNumber}`,
-      is_primary: false
-    });
-
-    if (!storedWallet) {
-      return ctx.reply('❌ Error creating wallet. Please try again.');
-    }
-
-    const sensitiveInfo = await ctx.reply(
-      `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
-      `<b>Wallet Address:</b>\n` +
-      `<code>${wallet.address}</code>\n\n` +
-      `<b>Private Key:</b>\n` +
-      `<code>${wallet.privateKey}</code>\n\n` +
-      `<b>Backup Phrase:</b>\n` +
-      `<code>${wallet.mnemonic}</code>\n\n` +
-      `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
-      `Copy and store this information securely NOW!`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
-          ]]
-        }
-      }
-    );
-
-    ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
-  } catch (error) {
-    console.error('New wallet command error:', error);
-    await ctx.reply('An error occurred while creating a new wallet.');
+    console.error('Gas command outer error:', error);
+    await ctx.reply('An unexpected error occurred.');
   }
 });
 
@@ -1254,7 +1171,55 @@ const setupBot = async () => {
   }
 };
 
-// Handle back to wallets action
+// Bot initialization function
+export async function initializeBot() {
+  try {
+    // Configure metadata
+    await setupBot();
+    
+    // Initialize bot components
+    const botInfo = await bot.telegram.getMe();
+    console.log('[Bot] Initializing:', {
+      timestamp: new Date().toISOString(),
+      username: botInfo.username,
+      id: botInfo.id,
+      can_join_groups: botInfo.can_join_groups,
+      can_read_all_group_messages: botInfo.can_read_all_group_messages
+    });
+
+    // Start in appropriate mode
+    if (process.env.WEBHOOK_URL) {
+      // In production, use webhook
+      const webhookUrl = process.env.WEBHOOK_URL;
+      console.log(`[Bot] Setting webhook to: ${webhookUrl}`);
+      await bot.telegram.setWebhook(webhookUrl);
+      console.log('[Bot] Running in webhook mode');
+    } else {
+      // In development, use polling
+      console.log('[Bot] No webhook URL provided, using polling mode');
+      await bot.launch();
+      console.log('[Bot] Running in polling mode');
+    }
+
+    console.log('[Bot] Initialized successfully');
+  } catch (error) {
+    console.error('[Bot] Failed to initialize:', error);
+    throw error;
+  }
+}
+
+// Enable graceful stop
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Start bot if this file is run directly
+if (require.main === module) {
+  // Start in appropriate mode
+  initializeBot().catch((error: unknown) => {
+    console.error('Failed to start bot:', error);
+    process.exit(1);
+  });
+}
 
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx: BotContext) => {
@@ -1561,7 +1526,7 @@ if (require.main === module) {
         can_join_groups: botInfo.can_join_groups,
         can_read_all_group_messages: botInfo.can_read_all_group_messages
       });
-      return initializeBot();
+      return startBot();
     })
     .catch((error: unknown) => {
       console.error('Failed to start bot:', error);
