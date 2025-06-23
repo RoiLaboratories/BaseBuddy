@@ -2,6 +2,7 @@
 import { Context, Telegraf, session } from 'telegraf';
 import { CallbackQuery, Update, Message } from 'telegraf/typings/core/types/typegram';
 import { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/types';
+import dotenv from 'dotenv';
 // No need for SessionFlavor, we'll use a simpler approach
 import { ethers } from 'ethers';
 import { 
@@ -19,9 +20,8 @@ import {
 import { executeTransfer, getAllTokenBalances, type TokenBalance, type TransactionData } from './transactionSender';
 import { BASE_TOKENS } from './utils/token-utils';
 import { estimateGasCost } from './transactionTracker';
-import { XMTPAgent } from './xmtpAgent';
 import { generateWallet } from './utils/generate-wallet';
-import dotenv from 'dotenv';
+import { XMTPAgent } from './xmtpAgent';
 
 // Load environment variables and validate
 dotenv.config();
@@ -1285,10 +1285,40 @@ const setupBot = async () => {
   }
 };
 
-// Run the bot if this file is run directly
+// Initialize bot
+export async function initializeBot() {
+  // Initialize bot components
+  await bot.telegram.getMe()
+    .then((botInfo) => {
+      console.log('[Bot] Initialized successfully:', {
+        timestamp: new Date().toISOString(),
+        username: botInfo.username,
+        id: botInfo.id,
+        can_join_groups: botInfo.can_join_groups,
+        can_read_all_group_messages: botInfo.can_read_all_group_messages
+      });
+    });
+
+  // Start webhook if URL is provided, otherwise use long polling
+  if (process.env.WEBHOOK_URL) {
+    const webhookUrl = process.env.WEBHOOK_URL;
+    console.log(`[Bot] Setting webhook to: ${webhookUrl}`);
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log('[Bot] Webhook set successfully');
+  } else {
+    console.log('[Bot] No webhook URL provided, using long polling');
+    await bot.launch();
+  }
+
+  // Enable graceful stop
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
+}
+
+// Start bot if running directly
 if (require.main === module) {
-  startBot().catch((error: unknown) => {
-    console.error('[Bot] Failed to start:', error);
+  initializeBot().catch((error) => {
+    console.error('[Bot] Failed to initialize:', error);
     process.exit(1);
   });
 }

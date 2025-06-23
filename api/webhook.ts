@@ -1,6 +1,16 @@
 import { type VercelRequest, type VercelResponse } from '@vercel/node';
-import { bot } from '../src/telegramBot';
+import { bot, initializeBot } from '../src/telegramBot';
 import { Message, Update } from 'telegraf/types';
+
+// Initialize bot when the module is loaded
+let botInitialized = false;
+
+async function ensureBotInitialized() {
+  if (!botInitialized) {
+    await initializeBot();
+    botInitialized = true;
+  }
+}
 
 function getUpdateType(update: Update): string {
   if ('message' in update) return 'message';
@@ -26,17 +36,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   });
 
   try {
-    // Verify the request is from Telegram
-    const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-    if (!telegramToken) {
-      console.error('[Webhook] TELEGRAM_BOT_TOKEN is not set');
-      return res.status(500).json({ error: 'Configuration error' });
-    }
-
-    // Log the request body
-    if (req.body) {
-      console.log('[Webhook] Update received:', JSON.stringify(req.body, null, 2));
-    }
+    // Initialize bot if needed
+    await ensureBotInitialized();
 
     // Only allow POST requests
     if (req.method !== 'POST') {
@@ -45,23 +46,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // Process the update
+    if (!req.body) {
+      console.error('[Webhook] No request body');
+      return res.status(400).json({ error: 'No request body' });
+    }
+
     const update: Update = req.body;
     const updateType = getUpdateType(update);
     console.log(`[Webhook] Processing ${updateType} update`);
 
-    try {
-      await bot.handleUpdate(update, res);
-      console.log('[Webhook] Update processed successfully');
-    } catch (error) {
-      console.error('[Webhook] Error processing update:', error);
-      return res.status(500).json({ error: 'Failed to process update' });
-    }
-
+    // Handle the update
+    await bot.handleUpdate(update, res);
+    
+    // Log success
     const duration = Date.now() - startTime;
-    console.log(`[Webhook] Request completed in ${duration}ms`);
+    console.log(`[Webhook] Update processed in ${duration}ms`);
+    
     return res.status(200).json({ ok: true });
+
   } catch (error) {
-    console.error('[Webhook] Unhandled error:', error);
+    // Log any errors
+    console.error('[Webhook] Error processing update:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }

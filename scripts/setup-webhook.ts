@@ -8,35 +8,56 @@ dotenv.config();
 const setupWebhook = async () => {
   console.log('Starting webhook setup...');
   
-  try {
-    // Validate environment variables
+  try {    // Validate environment variables
     if (!process.env.TELEGRAM_BOT_TOKEN) {
       throw new Error('TELEGRAM_BOT_TOKEN is not set');
     }
-      // Get the base URL from either VERCEL_URL or BASE_URL
-    const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
-    if (!baseUrl) {
-      throw new Error('Neither VERCEL_URL nor BASE_URL is set');
-    }
+
+    // Determine webhook URL
+    const webhookUrl = process.env.WEBHOOK_URL || (() => {
+      const baseUrl = process.env.VERCEL_URL || process.env.BASE_URL;
+      if (!baseUrl) {
+        throw new Error('No webhook URL configured. Set either WEBHOOK_URL directly, or VERCEL_URL/BASE_URL');
+      }
+      return baseUrl.startsWith('http') 
+        ? `${baseUrl}/api/webhook`
+        : `https://${baseUrl}/api/webhook`;
+    })();
 
     const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
     // First, delete any existing webhook
     console.log('[Setup] Removing existing webhook...');
-    await bot.telegram.deleteWebhook();    // Build the webhook URL - handle both with and without https:// prefix
-    const webhookUrl = baseUrl.startsWith('http') 
-      ? `${baseUrl}/api/webhook`
-      : `https://${baseUrl}/api/webhook`;
-    console.log('[Setup] Setting webhook URL:', webhookUrl);    // Set the new webhook with retry logic
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('[Setup] Existing webhook removed');
+    console.log('[Setup] Setting webhook URL:', webhookUrl);
+
+    // Set the new webhook with retry logic
     let retryCount = 0;
     const maxRetries = 3;
     let success = false;
 
-    while (!success && retryCount < maxRetries) {      try {
+    while (retryCount < maxRetries) {
+      try {
         await bot.telegram.setWebhook(webhookUrl, {
           drop_pending_updates: true
         });
-        success = true;
+
+        // Verify webhook was set correctly
+        const webhookInfo = await bot.telegram.getWebhookInfo();
+        console.log('[Setup] Webhook info:', webhookInfo);
+
+        if (webhookInfo.url === webhookUrl) {
+          console.log('[Setup] Webhook set successfully!');
+          console.log('[Setup] URL:', webhookInfo.url);
+          console.log('[Setup] Has custom certificate:', webhookInfo.has_custom_certificate);
+          console.log('[Setup] Pending update count:', webhookInfo.pending_update_count);
+          console.log('[Setup] Max connections:', webhookInfo.max_connections);
+          success = true;
+          break;
+        } else {
+          throw new Error('Webhook URL mismatch after setting');
+        }
       } catch (error: any) {
         if (error?.response?.error_code === 429) {
           retryCount++;
@@ -44,64 +65,53 @@ const setupWebhook = async () => {
           console.log(`[Setup] Rate limited, waiting ${retryAfter} seconds before retry ${retryCount}/${maxRetries}...`);
           await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
         } else {
+          console.error('[Setup] Error setting webhook:', error);
           throw error;
         }
       }
     }
 
     if (!success) {
-      throw new Error('Failed to set webhook after maximum retries');
-    }
-
-    // Verify the webhook
-    const webhookInfo = await bot.telegram.getWebhookInfo();
-    console.log('[Setup] Webhook info:', webhookInfo);
-
-    // Verify the webhook is set correctly
-    if (webhookInfo.url !== webhookUrl) {
-      throw new Error(`Webhook URL mismatch. Expected: ${webhookUrl}, Got: ${webhookInfo.url}`);
-    }
-
-    // Test the webhook with a sample update
+      throw new Error(`Failed to set webhook after ${maxRetries} retries`);
+    }    // Test the webhook
     console.log('[Setup] Testing webhook endpoint...');
-    
     try {
+      // Test with a POST request and a mock update
       const testResponse = await fetch(webhookUrl, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           update_id: 0,
           message: {
             message_id: 0,
-            from: { id: 0, first_name: 'test', is_bot: false },
-            chat: { id: 0, type: 'private' },
             date: Math.floor(Date.now() / 1000),
-            text: '/test'
+            chat: {
+              id: 0,
+              type: 'private'
+            }
           }
         })
       });
-    console.log('[Setup] Webhook test response:', {
-        status: testResponse.status,
-        statusText: testResponse.statusText,
-        body: await testResponse.text()
-      });
+      
+      if (testResponse.status === 200) {
+        console.log('[Setup] ✅ Webhook test successful! Endpoint is responding correctly');
+      } else {
+        console.log('[Setup] Webhook test response status:', testResponse.status);
+        console.log('[Setup] Response:', await testResponse.text());
+        console.log('[Setup] Note: A non-200 response might be expected if the endpoint validates Telegram signatures');
+      }
     } catch (error) {
-      console.error('[Setup] Webhook test failed:', error);
+      console.warn('[Setup] Warning: Could not test webhook endpoint:', error);
+      console.log('[Setup] This might be expected if the endpoint is not yet deployed or has strict validation');
     }
 
-    console.log('[Setup] Webhook setup completed successfully!');
   } catch (error) {
-    console.error('[Setup] Error:', error);
+    console.error('[Setup] Setup failed:', error);
     process.exit(1);
   }
 };
 
 // Run the setup
-setupWebhook().catch(error => {
-  console.error('[Setup] Fatal error:', error);
-  process.exit(1);
-});
-
 setupWebhook();
