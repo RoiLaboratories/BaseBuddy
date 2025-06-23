@@ -134,7 +134,7 @@ bot.catch((err: unknown, ctx: BotContext) => {
 });
 
 // Bot initialization and startup
-const startBot = async () => {
+export async function initializeBot() {
   try {
     // Configure metadata
     await setupBot();
@@ -161,37 +161,7 @@ const startBot = async () => {
     console.error('[Bot] Failed to initialize:', error);
     throw error;
   }
-};
-
-// Initialize bot startup
-const initializeBot = async () => {
-  try {
-    // Configure metadata
-    await setupBot();
-    
-    // Start in appropriate mode
-    if (process.env.NODE_ENV === 'production') {
-      // In production, we'll use webhooks
-      console.log('[Bot] Running in webhook mode');
-    } else {
-      // In development, use polling
-      await bot.launch();
-      console.log('[Bot] Running in polling mode');
-    }
-
-    const botInfo = await bot.telegram.getMe();
-    console.log('[Bot] Initialized successfully:', {
-      timestamp: new Date().toISOString(),
-      username: botInfo.username,
-      id: botInfo.id,
-      can_join_groups: botInfo.can_join_groups,
-      can_read_all_group_messages: botInfo.can_read_all_group_messages
-    });
-  } catch (error) {
-    console.error('[Bot] Failed to initialize:', error);
-    throw error;
-  }
-};
+}
 
 // Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
@@ -199,8 +169,7 @@ process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
 // Start bot if this file is run directly
 if (require.main === module) {
-  // Start in appropriate mode
-  startBot().catch((error: unknown) => {
+  initializeBot().catch((error: unknown) => {
     console.error('Failed to start bot:', error);
     process.exit(1);
   });
@@ -1285,43 +1254,7 @@ const setupBot = async () => {
   }
 };
 
-// Initialize bot
-export async function initializeBot() {
-  // Initialize bot components
-  await bot.telegram.getMe()
-    .then((botInfo) => {
-      console.log('[Bot] Initialized successfully:', {
-        timestamp: new Date().toISOString(),
-        username: botInfo.username,
-        id: botInfo.id,
-        can_join_groups: botInfo.can_join_groups,
-        can_read_all_group_messages: botInfo.can_read_all_group_messages
-      });
-    });
-
-  // Start webhook if URL is provided, otherwise use long polling
-  if (process.env.WEBHOOK_URL) {
-    const webhookUrl = process.env.WEBHOOK_URL;
-    console.log(`[Bot] Setting webhook to: ${webhookUrl}`);
-    await bot.telegram.setWebhook(webhookUrl);
-    console.log('[Bot] Webhook set successfully');
-  } else {
-    console.log('[Bot] No webhook URL provided, using long polling');
-    await bot.launch();
-  }
-
-  // Enable graceful stop
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
-}
-
-// Start bot if running directly
-if (require.main === module) {
-  initializeBot().catch((error) => {
-    console.error('[Bot] Failed to initialize:', error);
-    process.exit(1);
-  });
-}
+// Handle back to wallets action
 
 // Handle back to wallets action
 bot.action('back_to_wallets', async (ctx: BotContext) => {
@@ -1628,7 +1561,7 @@ if (require.main === module) {
         can_join_groups: botInfo.can_join_groups,
         can_read_all_group_messages: botInfo.can_read_all_group_messages
       });
-      return startBot();
+      return initializeBot();
     })
     .catch((error: unknown) => {
       console.error('Failed to start bot:', error);
