@@ -460,7 +460,7 @@ try {
     '• Transfers are instant and use the bot wallet\n' +
     '• Double-check the recipient username\n' +
     '• In group chats, mention me: <code>@BaseBuddyBot send 100 ENB to @user</code>\n' +
-    '• Supported tokens: ETH, USDC, PUMP, ENB</code>',
+    '• Supported tokens: ETH, USDC, PUMP, ENB',
     { parse_mode: 'HTML' }
   );
 } catch (error) {
