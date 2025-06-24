@@ -1069,11 +1069,12 @@ try {    if (!hasText(ctx)) {
       } else {
         return ctx.reply(`@${recipient} needs to create a wallet first. Ask them to DM me and use /start`);
       }
-    }
+    }    try {
+      // Get sender and recipient wallets
+      const senderWallets = await getUserWallets(sender.telegram_id);
+      const recipientWallets = await getUserWallets(recipientUser.telegram_id);
 
-    try {
-      // Get sender and recipient primary wallets
-      if (!sender.wallets?.length || !recipientUser.wallets?.length) {
+      if (!senderWallets.length || !recipientWallets.length) {
         if (chatType === 'private') {
           return ctx.reply('No wallets found. Please create a wallet first');
         } else {
@@ -1081,8 +1082,9 @@ try {    if (!hasText(ctx)) {
         }
       }
 
-      const senderPrimary = sender.wallets[0];
-      const recipientPrimary = recipientUser.wallets[0];
+      // Get primary wallets
+      const senderPrimary = senderWallets.find(w => w.is_primary);
+      const recipientPrimary = recipientWallets.find(w => w.is_primary);
 
       if (!senderPrimary || !recipientPrimary) {
         if (chatType === 'private') {
