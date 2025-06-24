@@ -6,21 +6,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Create provider with fallbacks
-const DEFAULT_RPC_URL = 'https://base.meowrpc.com';
-const RPC_URLS = [
-  process.env.BASE_RPC_URL,
-  'https://base.drpc.org',
-  'https://base.gateway.tenderly.co',
-  'https://base.meowrpc.com'
-].filter(Boolean);
-
-if (RPC_URLS.length === 0) {
-  RPC_URLS.push(DEFAULT_RPC_URL);
+// Create provider with Alchemy
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || '';
+if (!ALCHEMY_API_KEY) {
+  throw new Error('ALCHEMY_API_KEY environment variable is required');
 }
 
-let currentProviderIndex = 0;
-let _provider = new ethers.JsonRpcProvider(RPC_URLS[0]);
+const BASE_RPC_URL = `https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
+let _provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
 
 const UNISWAP_V3_FACTORY = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 
@@ -430,19 +423,19 @@ export async function retryOperation<T>(
 
 export async function getProvider(): Promise<ethers.Provider> {
   try {
-    // Test if current provider is responsive
-    await _provider.getBlockNumber();
+    // Test the connection
+    await _provider.getNetwork();
     return _provider;
   } catch (error) {
-    // Try next provider
-    currentProviderIndex = (currentProviderIndex + 1) % RPC_URLS.length;
-    const nextUrl = RPC_URLS[currentProviderIndex];
-    if (!nextUrl) {
-      throw new Error('No valid RPC URLs available');
+    console.error('Provider error:', error);
+    // Reinitialize provider
+    _provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+    try {
+      await _provider.getNetwork();
+      return _provider;
+    } catch (retryError) {
+      throw new Error('Failed to connect to Base network. Please check your API key and network status.');
     }
-    console.log(`Switching to RPC provider ${currentProviderIndex + 1}`);
-    _provider = new ethers.JsonRpcProvider(nextUrl);
-    return _provider;
   }
 }
 
