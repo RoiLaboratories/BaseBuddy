@@ -1250,11 +1250,10 @@ try {
   });
 
   if (!storedWallet) {
-    await ctx.answerCbQuery('❌ Error creating wallet');
+    await ctx.reply('❌ Error creating wallet. Please try again.');
     return;
   }
 
-  // Send sensitive info in a new message
   const sensitiveInfo = await ctx.reply(
     `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
     `<b>Wallet Address:</b>\n` +
@@ -1277,7 +1276,7 @@ try {
 
   ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
 
-  // Update the wallet list
+  // Send a message with the updated wallet list
   const updatedWallets = await getUserWallets(user.telegram_id);
   const walletsList = updatedWallets.map((w, index) => {
     const name = w.name || `Wallet ${index + 1}`;
@@ -1300,13 +1299,11 @@ try {
       { text: '🔄 Set Primary', callback_data: 'set_primary' }
     ],
     [
-      // { text: '✏️ Rename', callback_data: 'rename_wallet' },
       { text: '🗑️ Delete', callback_data: 'delete_wallet' }
     ]
   );
 
-  // Update the original message with the new wallet list
-  await ctx.editMessageText(
+  await ctx.reply(
     `<b>🏦 Your Wallets</b>\n\n` +
     `${walletsList}\n\n` +
     `<i>Select an action:</i>`,
@@ -1317,11 +1314,10 @@ try {
       }
     }
   );
-  
-  await ctx.answerCbQuery('✅ New wallet created successfully!');
+
 } catch (error) {
-  console.error('Error creating new wallet:', error);
-  await ctx.answerCbQuery('❌ Error creating new wallet');
+  console.error('New wallet command error:', error);
+  await ctx.reply('An error occurred while creating your wallet.');
 }
 });
 
