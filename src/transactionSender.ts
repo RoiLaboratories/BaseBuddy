@@ -122,11 +122,12 @@ export async function executeTransfer(
         throw new Error('Insufficient ETH balance');
       }
 
+      // You should actually send the transaction here and get the hash, but for now, return a dummy result
       return {
-        to: toAddress,
-        value: amountWei,
-        from: fromAddress,
-        type: 'eth'
+        hash: '', // Replace with actual transaction hash after sending
+        amount: amount,
+        token: 'ETH',
+        recipient: toAddress
       };
     }
 
@@ -152,14 +153,12 @@ export async function executeTransfer(
 
     const transferData = new ethers.Interface([
       'function transfer(address, uint256) returns (bool)'
-    ]).encodeFunctionData('transfer', [toAddress, amountInTokenDecimals]);
-
+    ]).encodeFunctionData('transfer', [toAddress, amountInTokenDecimals]);    // Return transfer data for token transaction
     return {
-      to: tokenAddress,
-      from: fromAddress,
-      data: transferData,
-      type: 'token',
-      tokenSymbol: token.symbol
+      hash: '', // Will be filled after transaction is sent
+      amount: amount,
+      token: token.symbol,
+      recipient: toAddress
     };
 
   } catch (error: unknown) {
