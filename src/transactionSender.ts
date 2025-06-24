@@ -26,6 +26,12 @@ export interface TransactionData {
   tokenSymbol?: string;
 }
 
+export interface TransactionResult {
+  hash: string;
+  success: boolean;
+  error?: string;
+}
+
 // Get all token balances for a wallet
 export async function getAllTokenBalances(address: string): Promise<TokenBalance[]> {
   const balances: TokenBalance[] = [];
@@ -97,109 +103,65 @@ export async function getAllTokenBalances(address: string): Promise<TokenBalance
   }
 }
 
-// Execute transfer from user's wallet
+// Execute transfer between addresses (requires sender's private key)
 export async function executeTransfer(
   fromAddress: string,
   toAddress: string,
   amount: string,
-  tokenAddress?: string
+  tokenAddress?: string // If undefined, it's an ETH transfer
 ): Promise<TransferResult> {
-  const provider = (await getProvider()) as ethers.JsonRpcProvider;
-  
   try {
-    if (!tokenAddress) {      // For ETH transfers
+    const provider = (await getProvider()) as ethers.JsonRpcProvider;
+
+    // For ETH transfers
+    if (!tokenAddress) {
       const balance = await provider.getBalance(fromAddress);
       const amountWei = ethers.parseEther(amount);
-      const gasEstimate = await provider.estimateGas({
+      
+      if (balance < amountWei) {
+        throw new Error('Insufficient ETH balance');
+      }
+
+      return {
         to: toAddress,
         value: amountWei,
-        from: fromAddress
-      });
-      const totalNeeded = amountWei + gasEstimate;
-
-      if (balance < totalNeeded) {
-        throw new Error('Insufficient ETH balance (including gas fees)');
-      }
-
-      // Execute ETH transfer from user's wallet
-      const txResponse = await provider.send('eth_sendTransaction', [{
         from: fromAddress,
-        to: toAddress,
-        value: `0x${amountWei.toString(16)}`, // Convert to hex
-        gas: `0x${gasEstimate.toString(16)}` // Convert to hex
-      }]);
-
-      // Wait for transaction confirmation
-      const receipt = await provider.waitForTransaction(txResponse);
-      
-      if (!receipt) {
-        throw new Error('Transaction failed: no receipt');
-      }
-      
-      return {
-        hash: receipt.hash,
-        amount,
-        token: 'ETH',
-        recipient: toAddress
-      };
-    } else {
-      // For token transfers
-      const erc20Abi = [
-        'function balanceOf(address) view returns (uint256)',
-        'function transfer(address, uint256) returns (bool)',
-        'function approve(address spender, uint256 amount) returns (bool)',
-        'function decimals() view returns (uint8)',
-        'function symbol() view returns (string)'
-      ];
-
-      const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, provider);
-      const tokenInfo = getTokenInfo(tokenAddress);
-      if (!tokenInfo) {
-        throw new Error('Invalid token');
-      }
-
-      const balance = await tokenContract.balanceOf(fromAddress);
-      const amountInTokenDecimals = ethers.parseUnits(amount, tokenInfo.decimals);
-      
-      if (balance < amountInTokenDecimals) {
-        throw new Error(`Insufficient ${tokenInfo.symbol} balance`);
-      }
-
-      // Check ETH balance for gas
-      const ethBalance = await provider.getBalance(fromAddress);
-      const transferData = tokenContract.interface.encodeFunctionData('transfer', [toAddress, amountInTokenDecimals]);
-      const gasEstimate = await provider.estimateGas({
-        from: fromAddress,
-        to: tokenAddress,
-        data: transferData
-      });
-      
-      if (ethBalance < gasEstimate) {
-        throw new Error('Insufficient ETH for gas fees');
-      }      // Execute token transfer using eth_sendTransaction from user's wallet
-      const txResponse = await provider.send('eth_sendTransaction', [{
-        from: fromAddress,
-        to: tokenAddress,
-        data: transferData,
-        gas: `0x${gasEstimate.toString(16)}`, // Convert to hex
-        gasPrice: await provider.getFeeData().then(data => 
-          data.gasPrice ? `0x${data.gasPrice.toString(16)}` : undefined
-        )
-      }]);
-
-      const receipt = await provider.waitForTransaction(txResponse);
-      
-      if (!receipt || !receipt.status) {
-        throw new Error('Transaction failed');
-      }
-
-      return {
-        hash: receipt.hash,
-        amount,
-        token: tokenInfo.symbol,
-        recipient: toAddress
+        type: 'eth'
       };
     }
+
+    // For token transfers
+    const token = BASE_TOKENS.find(t => t.address.toLowerCase() === tokenAddress.toLowerCase());
+    if (!token) {
+      throw new Error('Unsupported token');
+    }
+
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function balanceOf(address) view returns (uint256)', 'function decimals() view returns (uint8)'],
+      provider
+    );
+
+    const balance = await tokenContract.balanceOf(fromAddress);
+    const decimals = await tokenContract.decimals();
+    const amountInTokenDecimals = ethers.parseUnits(amount, decimals);
+
+    if (balance < amountInTokenDecimals) {
+      throw new Error(`Insufficient ${token.symbol} balance`);
+    }
+
+    const transferData = new ethers.Interface([
+      'function transfer(address, uint256) returns (bool)'
+    ]).encodeFunctionData('transfer', [toAddress, amountInTokenDecimals]);
+
+    return {
+      to: tokenAddress,
+      from: fromAddress,
+      data: transferData,
+      type: 'token',
+      tokenSymbol: token.symbol
+    };
+
   } catch (error: unknown) {
     console.error('Transfer error:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
