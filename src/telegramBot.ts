@@ -1458,3 +1458,107 @@ if (require.main === module) {
     });
 }
 
+// Function to handle new wallet creation
+async function createNewWallet(ctx: BotContext, username: string): Promise<void> {
+  const chatType = ctx.chat?.type;
+
+  if (chatType !== 'private') {
+    const options = ctx.message?.message_thread_id 
+      ? { message_thread_id: ctx.message.message_thread_id }
+      : undefined;
+    await ctx.reply(
+      `@${username}, for privacy reasons, please create wallets in our private chat.`,
+      options
+    );
+    return;
+  }
+
+  const user = await getUserByTelegramUsername(username);
+  if (!user) {
+    await ctx.reply('Please use /start to create your account first.');
+    return;
+  }
+
+  const wallets = await getUserWallets(user.telegram_id);
+  if (wallets.length >= 5) {
+    await ctx.reply('❌ Maximum wallet limit reached (5)');
+    return;
+  }
+
+  const wallet = generateWallet();
+  const walletNumber = wallets.length + 1;
+  
+  const storedWallet = await createWallet({
+    telegram_id: user.telegram_id,
+    address: wallet.address,
+    name: `Wallet ${walletNumber}`,
+    is_primary: false
+  });
+
+  if (!storedWallet) {
+    await ctx.reply('❌ Error creating wallet. Please try again.');
+    return;
+  }
+
+  const sensitiveInfo = await ctx.reply(
+    `<b>🔐 Your New Wallet Is Ready!</b>\n\n` +
+    `<b>Wallet Address:</b>\n` +
+    `<code>${wallet.address}</code>\n\n` +
+    `<b>Private Key:</b>\n` +
+    `<code>${wallet.privateKey}</code>\n\n` +
+    `<b>Backup Phrase:</b>\n` +
+    `<code>${wallet.mnemonic}</code>\n\n` +
+    `⚠️ <b>WARNING:</b> This message will self-destruct once you confirm saving these details.\n` +
+    `Copy and store this information securely NOW!`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ I've Safely Saved My Wallet Details", callback_data: 'confirm_wallet_save' }
+        ]]
+      }
+    }
+  );
+
+  ctx.session.sensitiveMessageId = sensitiveInfo.message_id;
+
+  // Send a message with the updated wallet list
+  const updatedWallets = await getUserWallets(user.telegram_id);
+  const walletsList = updatedWallets.map((w, index) => {
+    const name = w.name || `Wallet ${index + 1}`;
+    const isPrimary = w.is_primary ? ' (Primary)' : '';
+    const shortAddress = `${w.address.slice(0, 6)}...${w.address.slice(-4)}`;
+    return `${index + 1}. ${name}${isPrimary}\n   ${shortAddress}`;
+  }).join('\n\n');
+
+  const inlineKeyboard = [];
+  updatedWallets.forEach((w) => {
+    inlineKeyboard.push([{
+      text: `📋 Copy ${w.name || 'Wallet'} Address`,
+      callback_data: `copy_${w.id}`
+    }]);
+  });
+
+  inlineKeyboard.push(
+    [
+      { text: '➕ New Wallet', callback_data: 'new_wallet' },
+      { text: '🔄 Set Primary', callback_data: 'set_primary' }
+    ],
+    [
+      { text: '🗑️ Delete', callback_data: 'delete_wallet' }
+    ]
+  );
+
+  await ctx.reply(
+    `<b>🏦 Your Wallets</b>\n\n` +
+    `${walletsList}\n\n` +
+    `<i>Select an action:</i>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: inlineKeyboard
+      }
+    }
+  );
+}
+
