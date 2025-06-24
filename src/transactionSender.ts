@@ -107,8 +107,7 @@ export async function executeTransfer(
   const provider = (await getProvider()) as ethers.JsonRpcProvider;
   
   try {
-    if (!tokenAddress) {
-      // For ETH transfers
+    if (!tokenAddress) {      // For ETH transfers
       const balance = await provider.getBalance(fromAddress);
       const amountWei = ethers.parseEther(amount);
       const gasEstimate = await provider.estimateGas({
@@ -122,14 +121,15 @@ export async function executeTransfer(
         throw new Error('Insufficient ETH balance (including gas fees)');
       }
 
-      // Execute ETH transfer directly from user's wallet
+      // Execute ETH transfer from user's wallet
       const txResponse = await provider.send('eth_sendTransaction', [{
         from: fromAddress,
         to: toAddress,
-        value: amountWei.toString(16), // Convert to hex
-        gas: gasEstimate.toString(16) // Convert to hex
+        value: `0x${amountWei.toString(16)}`, // Convert to hex
+        gas: `0x${gasEstimate.toString(16)}` // Convert to hex
       }]);
-      
+
+      // Wait for transaction confirmation
       const receipt = await provider.waitForTransaction(txResponse);
       
       if (!receipt) {
@@ -147,6 +147,7 @@ export async function executeTransfer(
       const erc20Abi = [
         'function balanceOf(address) view returns (uint256)',
         'function transfer(address, uint256) returns (bool)',
+        'function approve(address spender, uint256 amount) returns (bool)',
         'function decimals() view returns (uint8)',
         'function symbol() view returns (string)'
       ];
@@ -175,14 +176,15 @@ export async function executeTransfer(
       
       if (ethBalance < gasEstimate) {
         throw new Error('Insufficient ETH for gas fees');
-      }
-
-      // Execute token transfer directly from user's wallet
+      }      // Execute token transfer using eth_sendTransaction from user's wallet
       const txResponse = await provider.send('eth_sendTransaction', [{
         from: fromAddress,
         to: tokenAddress,
         data: transferData,
-        gas: gasEstimate.toString(16) // Convert to hex
+        gas: `0x${gasEstimate.toString(16)}`, // Convert to hex
+        gasPrice: await provider.getFeeData().then(data => 
+          data.gasPrice ? `0x${data.gasPrice.toString(16)}` : undefined
+        )
       }]);
 
       const receipt = await provider.waitForTransaction(txResponse);
