@@ -1366,8 +1366,7 @@ try {
       console.error('Error deleting sensitive message:', error);
       await ctx.reply('❌ Could not delete the message. Please delete it manually.');
     }
-  }
-  // Get updated wallet list and show it
+  }  // Get updated wallet list and show it
   const username = ctx.from?.username;
   if (username) {
     const user = await getUserByTelegramUsername(username);
@@ -1399,50 +1398,6 @@ try {
       );
 
       await ctx.reply(
-        `<b>🏦 Your Wallets</b>\n\n` +
-        `${walletsList}\n\n` +
-        `<i>Select an action:</i>`,
-        {
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: inlineKeyboard
-          }
-        }
-      );
-    }
-  }
-  if (username) {
-    const user = await getUserByTelegramUsername(username);
-    if (user) {
-      const wallets = await getUserWallets(user.telegram_id);
-      const walletsList = wallets.map((wallet, index) => {
-        const name = wallet.name || `Wallet ${index + 1}`;
-        const isPrimary = wallet.is_primary ? ' (Primary)' : '';
-        const shortAddress = `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
-        return `${index + 1}. ${name}${isPrimary}\n   ${shortAddress}`;
-      }).join('\n\n');
-
-      const inlineKeyboard = [];
-      wallets.forEach((wallet) => {
-        inlineKeyboard.push([{
-          text: `📋 Copy ${wallet.name || 'Wallet'} Address`,
-          callback_data: `copy_${wallet.id}`
-        }]);
-      });
-
-      inlineKeyboard.push(
-        [
-          { text: '➕ New Wallet', callback_data: 'new_wallet' },
-          { text: '🔄 Set Primary', callback_data: 'set_primary' }
-        ],
-        [
-          // { text: '✏️ Rename', callback_data: 'rename_wallet' },
-          { text: '🗑️ Delete', callback_data: 'delete_wallet' }
-        ]
-      );
-
-      await ctx.reply(
-        `✅ Great! I've deleted the sensitive information.\n\n` +
         `<b>🏦 Your Updated Wallet List:</b>\n\n` +
         `${walletsList}\n\n` +
         `<i>Select an action:</i>`,
